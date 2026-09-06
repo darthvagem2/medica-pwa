@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --bg: 248 250 252;
+  --card: 255 255 255;
+  --text: 15 23 42;
+  --muted: 100 116 139;
+  --line: 226 232 240;
+  --accent: 14 165 233;
+}
+
+.dark {
+  color-scheme: dark;
+  --bg: 2 6 23;
+  --card: 15 23 42;
+  --text: 241 245 249;
+  --muted: 148 163 184;
+  --line: 51 65 85;
+  --accent: 56 189 248;
+}
+
+html { background: rgb(var(--bg)); }
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: rgb(var(--bg));
+  color: rgb(var(--text));
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+  -webkit-tap-highlight-color: transparent;
+  padding-top: env(safe-area-inset-top);
+}
+button, input, select, textarea { font: inherit; }
+button { touch-action: manipulation; }
+:focus-visible { outline: 3px solid rgb(var(--accent) / .45); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+.app-shell { max-width: 760px; margin: 0 auto; min-height: 100dvh; padding: 18px 16px calc(96px + env(safe-area-inset-bottom)); }
+.card { background: rgb(var(--card)); border: 1px solid rgb(var(--line)); border-radius: 22px; box-shadow: 0 10px 28px rgba(15,23,42,.06); }
+.muted { color: rgb(var(--muted)); }
+.status-pill { display:inline-flex; align-items:center; gap:.35rem; border-radius:999px; padding:.3rem .65rem; font-size:.75rem; font-weight:800; }
+.input { width:100%; border:1px solid rgb(var(--line)); background:rgb(var(--card)); color:rgb(var(--text)); border-radius:14px; padding:.8rem .9rem; }
+.label { font-size:.82rem; font-weight:800; margin-bottom:.35rem; display:block; }
+.btn-primary { border:0; border-radius:16px; background:#0284c7; color:white; font-weight:900; padding:.85rem 1rem; min-height:48px; }
+.btn-secondary { border:1px solid rgb(var(--line)); border-radius:14px; background:rgb(var(--card)); color:rgb(var(--text)); font-weight:800; padding:.7rem .9rem; min-height:44px; }
