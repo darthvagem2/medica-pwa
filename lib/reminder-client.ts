@@ -48,18 +48,35 @@ async function parseApiError(
     try {
       const json = JSON.parse(text);
 
-      if (typeof json?.error === 'string') {
-        return `${fallback}: ${json.error}`;
+      const error =
+        typeof json?.error === 'string'
+          ? json.error
+          : fallback;
+
+      const detail =
+        typeof json?.detail === 'string'
+          ? json.detail
+          : '';
+
+      const stage =
+        typeof json?.stage === 'string'
+          ? json.stage
+          : '';
+
+      let message = error;
+
+      if (stage) {
+        message += ` [${stage}]`;
       }
 
-      if (typeof json?.message === 'string') {
-        return `${fallback}: ${json.message}`;
+      if (detail) {
+        message += ` — ${detail}`;
       }
+
+      return message;
     } catch {
-      // resposta não era JSON
+      return `${fallback}: ${text}`;
     }
-
-    return `${fallback}: ${text}`;
   } catch {
     return `${fallback} (${response.status})`;
   }
