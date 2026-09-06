@@ -25,6 +25,36 @@ export function getPool(): Pool | null {
         },
 
     max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
+  });
+
+  cachedPool.on('error', (error) => {
+    console.error(
+      '[PostgreSQL Pool]',
+      error
+    );
+  });
+
+  return cachedPool;
+}
+
+/**
+ * Compatibilidade com as rotas antigas
+ * que ainda importam { pool }.
+ */
+export const pool = getPool();
+
+  cachedPool = new Pool({
+    connectionString,
+
+    ssl: connectionString.includes('localhost')
+      ? undefined
+      : {
+          rejectUnauthorized: false,
+        },
+
+    max: 5,
 
     idleTimeoutMillis: 30000,
 
