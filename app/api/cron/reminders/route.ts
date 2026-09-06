@@ -1,29 +1,167 @@
 import { NextResponse } from 'next/server';
-import type { PoolClient, Pool } from 'pg';
-
+import { Pool, type PoolClient } from 'pg';
 import {
   fromZonedTime,
   toZonedTime,
 } from 'date-fns-tz';
 
-import { getPool } from '@/lib/server-db';
 import { getWebPush } from '@/lib/push-server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
 /**
- * Verifica se o horário local atual está dentro
- * do período silencioso.
+ * =========================================================
+ * POSTGRESQL
+ * =========================================================
+ *
+ * O Pool fica dentro desta própria rota.
+ *
+ * Isso evita depender de server-db.ts durante o diagnóstico
+ * e também evita criar uma nova conexão a cada chamada quando
+ * a mesma instância serverless é reutilizada.
  */
-function inQuiet(
-  now: Date,
+
+let cachedPool: Pool | null = null;
+
+function getDbPool(): Pool | null {
+  const connectionString =
+    process.env.DATABASE_URL?.trim();
+
+  if (!connectionString) {
+    return null;
+  }
+
+  if (cachedPool) {
+    return cachedPool;
+  }
+
+  cachedPool = new Pool({
+    connectionString,
+
+    /**
+     * Supabase exige SSL fora de localhost.
+     */
+    ssl: connectionString.includes('localhost')
+      ? undefined
+      : {
+          rejectUnauthorized: false,
+        },
+
+    /**
+     * Poucas conexões porque estamos usando
+     * Supabase Transaction Pooler.
+     */
+    max: 2,
+
+    idleTimeoutMillis: 30_000,
+
+    connectionTimeoutMillis: 10_000,
+  });
+
+  cachedPool.on('error', (error) => {
+    console.error(
+      '[CRON][POSTGRES] Erro inesperado no pool:',
+      error
+    );
+  });
+
+  return cachedPool;
+}
+
+/**
+ * =========================================================
+ * UTILIDADES
+ * =========================================================
+ */
+
+function safeErrorMessage(
+  error: unknown
+): string {
+  let message =
+    error instanceof Error
+      ? error.message
+      : String(error);
+
+  /**
+   * Remove connection strings caso alguma biblioteca
+   * inclua credenciais dentro da mensagem.
+   */
+  message = message.replace(
+    /postgres(?:ql)?:\/\/[^@\s]+@/gi,
+    'postgresql://***@'
+  );
+
+  /**
+   * Remove Authorization Bearer caso apareça
+   * acidentalmente em uma exceção.
+   */
+  message = message.replace(
+    /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
+    'Bearer ***'
+  );
+
+  return message;
+}
+
+function getStatusCode(
+  error: unknown
+): number | null {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'statusCode' in error
+  ) {
+    const value = Number(
+      (error as { statusCode?: unknown })
+        .statusCode
+    );
+
+    return Number.isFinite(value)
+      ? value
+      : null;
+  }
+
+  return null;
+}
+
+function validTime(
+  value: unknown
+): value is string {
+  if (
+    typeof value !== 'string' ||
+    !/^\d{2}:\d{2}$/.test(value)
+  ) {
+    return false;
+  }
+
+  const [hour, minute] =
+    value.split(':').map(Number);
+
+  return (
+    hour >= 0 &&
+    hour <= 23 &&
+    minute >= 0 &&
+    minute <= 59
+  );
+}
+
+function inQuietHours(
+  localNow: Date,
   start: string,
   end: string
 ): boolean {
+  if (
+    !validTime(start) ||
+    !validTime(end)
+  ) {
+    return false;
+  }
+
   const nowMinutes =
-    now.getHours() * 60 +
-    now.getMinutes();
+    localNow.getHours() * 60 +
+    localNow.getMinutes();
 
   const [startHour, startMinute] =
     start.split(':').map(Number);
@@ -40,8 +178,16 @@ function inQuiet(
     endMinute;
 
   /**
+   * Mesmo horário = horário silencioso desativado
+   * para evitar interpretar como 24 horas.
+   */
+  if (startMinutes === endMinutes) {
+    return false;
+  }
+
+  /**
    * Exemplo:
-   * 22:00 → 23:00
+   * 13:00 → 15:00
    */
   if (startMinutes < endMinutes) {
     return (
@@ -60,31 +206,23 @@ function inQuiet(
   );
 }
 
-/**
- * Calcula quando termina o horário silencioso,
- * respeitando o fuso horário do dispositivo.
- */
-function quietEndUtc(
+function getQuietEndUtc(
   nowUtc: Date,
   timezone: string,
   start: string,
   end: string
 ): Date {
-  const local =
+  const localNow =
     toZonedTime(
       nowUtc,
       timezone
     );
 
-  const [endHour, endMinute] =
-    end.split(':').map(Number);
-
   const [startHour, startMinute] =
     start.split(':').map(Number);
 
-  const nowMinutes =
-    local.getHours() * 60 +
-    local.getMinutes();
+  const [endHour, endMinute] =
+    end.split(':').map(Number);
 
   const startMinutes =
     startHour * 60 +
@@ -94,8 +232,12 @@ function quietEndUtc(
     endHour * 60 +
     endMinute;
 
+  const nowMinutes =
+    localNow.getHours() * 60 +
+    localNow.getMinutes();
+
   const target =
-    new Date(local);
+    new Date(localNow);
 
   target.setHours(
     endHour,
@@ -105,18 +247,15 @@ function quietEndUtc(
   );
 
   /**
-   * Exemplo:
+   * Horário silencioso cruza meia-noite:
    *
-   * silencioso:
    * 23:00 → 07:00
    *
-   * agora:
-   * 23:30
-   *
-   * o término é amanhã às 07:00.
+   * Se agora for 23:30,
+   * o fim será amanhã 07:00.
    */
   if (
-    startMinutes >= endMinutes &&
+    startMinutes > endMinutes &&
     nowMinutes >= startMinutes
   ) {
     target.setDate(
@@ -130,60 +269,26 @@ function quietEndUtc(
   );
 }
 
-/**
- * Evita vazar connection strings,
- * tokens e outros dados sensíveis
- * nas respostas de diagnóstico.
- */
-function safeErrorMessage(
-  error: unknown
-): string {
-  let message: string;
-
-  if (error instanceof Error) {
-    message = error.message;
-  } else {
-    message = String(error);
-  }
-
-  return message
-    .replace(
-      /postgres(?:ql)?:\/\/[^@\s]+@/gi,
-      'postgresql://***@'
-    )
-    .replace(
-      /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
-      'Bearer ***'
-    );
-}
-
-/**
- * Tenta executar rollback sem mascarar
- * o erro original.
- */
 async function safeRollback(
   client: PoolClient
 ): Promise<void> {
   try {
     await client.query('rollback');
-  } catch (rollbackError) {
+  } catch (error) {
     console.error(
-      '[CRON] Falha ao executar rollback:',
-      rollbackError
+      '[CRON] Falha no rollback:',
+      error
     );
   }
 }
 
-/**
- * Libera o lock de um job em caso de falha.
- */
 async function unlockJob(
-  dbPool: Pool,
+  pool: Pool,
   deviceId: string,
   occurrenceId: string
 ): Promise<void> {
   try {
-    await dbPool.query(
+    await pool.query(
       `
         update reminder_jobs
 
@@ -203,33 +308,84 @@ async function unlockJob(
   } catch (error) {
     console.error(
       '[CRON] Falha ao liberar lock:',
-      error
+      safeErrorMessage(error)
     );
   }
 }
 
+function parseSubscription(
+  value: unknown
+) {
+  if (!value) {
+    throw new Error(
+      'Push subscription vazia.'
+    );
+  }
+
+  let subscription = value;
+
+  if (
+    typeof subscription === 'string'
+  ) {
+    subscription =
+      JSON.parse(subscription);
+  }
+
+  if (
+    typeof subscription !== 'object' ||
+    subscription === null
+  ) {
+    throw new Error(
+      'Push subscription inválida.'
+    );
+  }
+
+  const sub =
+    subscription as {
+      endpoint?: string;
+      keys?: {
+        p256dh?: string;
+        auth?: string;
+      };
+    };
+
+  if (
+    !sub.endpoint ||
+    !sub.keys?.p256dh ||
+    !sub.keys?.auth
+  ) {
+    throw new Error(
+      'Push subscription incompleta.'
+    );
+  }
+
+  return sub;
+}
+
+/**
+ * =========================================================
+ * ENDPOINT DO CRON
+ * =========================================================
+ */
+
 export async function GET(
-  req: Request
+  request: Request
 ) {
   /**
-   * ===================================
-   * 1. AUTENTICAÇÃO DO CRON
-   * ===================================
+   * =======================================================
+   * 1. AUTENTICAR CRON
+   * =======================================================
    */
 
   const cronSecret =
     process.env.CRON_SECRET?.trim();
 
-  if (
-    process.env.NODE_ENV ===
-      'production' &&
-    !cronSecret
-  ) {
+  if (!cronSecret) {
     return NextResponse.json(
       {
         ok: false,
         error:
-          'CRON_SECRET não configurado',
+          'CRON_SECRET não configurado na Vercel.',
       },
       {
         status: 503,
@@ -238,14 +394,13 @@ export async function GET(
   }
 
   const authorization =
-    req.headers.get(
+    request.headers.get(
       'authorization'
     );
 
   if (
-    cronSecret &&
     authorization !==
-      `Bearer ${cronSecret}`
+    `Bearer ${cronSecret}`
   ) {
     return NextResponse.json(
       {
@@ -259,24 +414,18 @@ export async function GET(
   }
 
   /**
-   * ===================================
+   * =======================================================
    * 2. INICIALIZAR POSTGRESQL
-   * ===================================
-   *
-   * Agora usamos getPool().
-   *
-   * Dessa forma o Pool não é criado
-   * automaticamente durante o import
-   * do módulo.
+   * =======================================================
    */
 
   let dbPool: Pool | null;
 
   try {
-    dbPool = getPool();
+    dbPool = getDbPool();
   } catch (error) {
     console.error(
-      '[CRON] Falha ao inicializar PostgreSQL:',
+      '[CRON] Falha ao criar Pool:',
       error
     );
 
@@ -284,8 +433,11 @@ export async function GET(
       {
         ok: false,
 
+        stage:
+          'database-initialization',
+
         error:
-          'Falha ao inicializar banco de dados',
+          'Falha ao inicializar banco de dados.',
 
         detail:
           safeErrorMessage(error),
@@ -300,8 +452,12 @@ export async function GET(
     return NextResponse.json(
       {
         ok: false,
+
+        stage:
+          'database-configuration',
+
         error:
-          'DATABASE_URL não configurada',
+          'DATABASE_URL não configurada na Vercel.',
       },
       {
         status: 503,
@@ -310,43 +466,9 @@ export async function GET(
   }
 
   /**
-   * ===================================
-   * 3. INICIALIZAR WEB PUSH / VAPID
-   * ===================================
-   */
-
-  let webPush: ReturnType<
-    typeof getWebPush
-  >;
-
-  try {
-    webPush = getWebPush();
-  } catch (error) {
-    console.error(
-      '[CRON] Falha ao inicializar Web Push:',
-      error
-    );
-
-    return NextResponse.json(
-      {
-        ok: false,
-
-        error:
-          'Falha ao configurar Web Push',
-
-        detail:
-          safeErrorMessage(error),
-      },
-      {
-        status: 503,
-      }
-    );
-  }
-
-  /**
-   * ===================================
-   * 4. TESTAR CONEXÃO COM POSTGRESQL
-   * ===================================
+   * =======================================================
+   * 3. TESTAR CONEXÃO COM SUPABASE
+   * =======================================================
    */
 
   let client: PoolClient;
@@ -356,7 +478,7 @@ export async function GET(
       await dbPool.connect();
   } catch (error) {
     console.error(
-      '[CRON] Falha ao conectar ao PostgreSQL:',
+      '[CRON] Falha em pool.connect():',
       error
     );
 
@@ -364,8 +486,11 @@ export async function GET(
       {
         ok: false,
 
+        stage:
+          'database-connection',
+
         error:
-          'Falha ao conectar ao banco de dados',
+          'Falha ao conectar ao banco de dados.',
 
         detail:
           safeErrorMessage(error),
@@ -377,9 +502,83 @@ export async function GET(
   }
 
   /**
-   * ===================================
+   * Antes de prosseguir, fazemos uma consulta simples.
+   */
+  try {
+    await client.query(
+      'select 1'
+    );
+  } catch (error) {
+    client.release();
+
+    console.error(
+      '[CRON] Banco conectado, mas SELECT 1 falhou:',
+      error
+    );
+
+    return NextResponse.json(
+      {
+        ok: false,
+
+        stage:
+          'database-test',
+
+        error:
+          'A conexão foi criada, mas o PostgreSQL recusou a consulta.',
+
+        detail:
+          safeErrorMessage(error),
+      },
+      {
+        status: 500,
+      }
+    );
+  }
+
+  /**
+   * =======================================================
+   * 4. CONFIGURAR WEB PUSH
+   * =======================================================
+   */
+
+  let webPush: ReturnType<
+    typeof getWebPush
+  >;
+
+  try {
+    webPush =
+      getWebPush();
+  } catch (error) {
+    client.release();
+
+    console.error(
+      '[CRON] Falha no VAPID:',
+      error
+    );
+
+    return NextResponse.json(
+      {
+        ok: false,
+
+        stage:
+          'vapid',
+
+        error:
+          'Falha ao configurar Web Push.',
+
+        detail:
+          safeErrorMessage(error),
+      },
+      {
+        status: 503,
+      }
+    );
+  }
+
+  /**
+   * =======================================================
    * 5. BUSCAR JOBS VENCIDOS
-   * ===================================
+   * =======================================================
    */
 
   let jobs: any[] = [];
@@ -419,7 +618,9 @@ export async function GET(
               j.locked_until is null
 
               or
-              j.locked_until < now()
+
+              j.locked_until
+                < now()
             )
 
           order by
@@ -432,13 +633,14 @@ export async function GET(
         `
       );
 
-    jobs = result.rows;
+    jobs =
+      result.rows;
 
     /**
-     * Reserva os jobs por dois minutos.
+     * Reserva os jobs por 2 minutos.
      *
-     * Isso reduz a chance de dois workers
-     * enviarem o mesmo lembrete.
+     * Assim dois cron workers não enviam
+     * a mesma notificação simultaneamente.
      */
     for (const job of jobs) {
       await client.query(
@@ -473,6 +675,8 @@ export async function GET(
       client
     );
 
+    client.release();
+
     console.error(
       '[CRON] Falha ao consultar reminder_jobs:',
       error
@@ -482,8 +686,11 @@ export async function GET(
       {
         ok: false,
 
+        stage:
+          'reminder-query',
+
         error:
-          'Falha ao consultar lembretes',
+          'Falha ao consultar lembretes.',
 
         detail:
           safeErrorMessage(error),
@@ -492,57 +699,62 @@ export async function GET(
         status: 500,
       }
     );
-  } finally {
-    client.release();
   }
 
+  client.release();
+
   /**
-   * ===================================
+   * =======================================================
    * 6. PROCESSAR JOBS
-   * ===================================
+   * =======================================================
    */
 
   let sent = 0;
   let failed = 0;
   let quiet = 0;
-  let expiredSubscriptions = 0;
+  let expired = 0;
 
   for (const job of jobs) {
     const now =
       new Date();
 
     const timezone =
-      job.timezone ||
-      'UTC';
+      typeof job.timezone ===
+        'string'
+        ? job.timezone
+        : 'UTC';
 
     /**
-     * ===================================
+     * =====================================================
      * HORÁRIO SILENCIOSO
-     * ===================================
+     * =====================================================
      */
 
     if (
       job.quiet_enabled === true &&
-      job.quiet_start &&
-      job.quiet_end
+      validTime(
+        job.quiet_start
+      ) &&
+      validTime(
+        job.quiet_end
+      )
     ) {
-      const localNow =
-        toZonedTime(
-          now,
-          timezone
-        );
+      try {
+        const localNow =
+          toZonedTime(
+            now,
+            timezone
+          );
 
-      const isQuiet =
-        inQuiet(
-          localNow,
-          job.quiet_start,
-          job.quiet_end
-        );
-
-      if (isQuiet) {
-        try {
+        if (
+          inQuietHours(
+            localNow,
+            job.quiet_start,
+            job.quiet_end
+          )
+        ) {
           const resumeAt =
-            quietEndUtc(
+            getQuietEndUtc(
               now,
               timezone,
               job.quiet_start,
@@ -556,11 +768,9 @@ export async function GET(
               set
                 next_notify_at = $3,
 
-                locked_until =
-                  null,
+                locked_until = null,
 
-                updated_at =
-                  now()
+                updated_at = now()
 
               where
                 device_id = $1
@@ -577,45 +787,38 @@ export async function GET(
           quiet++;
 
           continue;
-        } catch (error) {
-          failed++;
-
-          console.error(
-            '[CRON] Falha ao adiar lembrete por horário silencioso:',
-            {
-              occurrenceId:
-                job.occurrence_id,
-
-              error:
-                safeErrorMessage(
-                  error
-                ),
-            }
-          );
-
-          await unlockJob(
-            dbPool,
-            job.device_id,
-            job.occurrence_id
-          );
-
-          continue;
         }
+      } catch (error) {
+        failed++;
+
+        console.error(
+          '[CRON] Erro no horário silencioso:',
+          safeErrorMessage(error)
+        );
+
+        await unlockJob(
+          dbPool,
+          job.device_id,
+          job.occurrence_id
+        );
+
+        continue;
       }
     }
 
     /**
-     * ===================================
-     * DEFINIR TIPO DO ALERTA
-     * ===================================
+     * =====================================================
+     * DEFINIR SE ESTÁ ATRASADO
+     * =====================================================
      */
 
     const deadlinePassed =
       Boolean(
         job.deadline_at &&
-        new Date(
-          job.deadline_at
-        ) <= now
+          new Date(
+            job.deadline_at
+          ).getTime() <=
+            now.getTime()
       );
 
     const overdue =
@@ -625,21 +828,23 @@ export async function GET(
       job.phase ===
         'repeat';
 
-    const title =
-      overdue
-        ? '⚠️ Medicamento ainda não confirmado'
-        : 'Hora do medicamento';
-
-    const body =
-      overdue
-        ? `Você ainda não marcou ${job.medication_label} como tomado.`
-        : `Está na hora de ${job.medication_label}.`;
+    /**
+     * =====================================================
+     * PAYLOAD DA NOTIFICAÇÃO
+     * =====================================================
+     */
 
     const payload =
       JSON.stringify({
-        title,
+        title:
+          overdue
+            ? '⚠️ Medicamento ainda não confirmado'
+            : 'Hora do medicamento',
 
-        body,
+        body:
+          overdue
+            ? `Você ainda não marcou ${job.medication_label} como tomado.`
+            : `Está na hora de ${job.medication_label}.`,
 
         tag:
           `med-${job.occurrence_id}`,
@@ -659,42 +864,23 @@ export async function GET(
           overdue,
 
         vibration:
-          Boolean(
-            job.vibration
-          ),
+          job.vibration !== false,
 
         sound:
-          Boolean(
-            job.sound
-          ),
+          job.sound !== false,
       });
 
     /**
-     * ===================================
+     * =====================================================
      * ENVIAR WEB PUSH
-     * ===================================
+     * =====================================================
      */
 
     try {
-      let subscription =
-        job.subscription;
-
-      /**
-       * PostgreSQL/jsonb normalmente
-       * já devolve objeto.
-       *
-       * Mas aceitamos string também
-       * para maior robustez.
-       */
-      if (
-        typeof subscription ===
-        'string'
-      ) {
-        subscription =
-          JSON.parse(
-            subscription
-          );
-      }
+      const subscription =
+        parseSubscription(
+          job.subscription
+        );
 
       await webPush.sendNotification(
         subscription,
@@ -707,13 +893,9 @@ export async function GET(
       sent++;
 
       /**
-       * ===================================
+       * ===================================================
        * MEDICAMENTO OPCIONAL
-       * ===================================
-       *
-       * Se não for obrigatório,
-       * depois do lembrete principal
-       * encerramos este job.
+       * ===================================================
        */
 
       if (
@@ -753,30 +935,28 @@ export async function GET(
       }
 
       /**
-       * ===================================
+       * ===================================================
        * CALCULAR PRÓXIMO ALERTA
-       * ===================================
+       * ===================================================
        */
 
       let nextNotifyAt: Date;
-
       let nextPhase:
         | 'deadline'
         | 'repeat';
 
       /**
-       * Primeiro alerta ocorreu
-       * antes do horário limite.
-       *
-       * O próximo será exatamente
-       * no deadline.
+       * Se foi o primeiro lembrete e ainda existe
+       * um deadline futuro, o próximo alerta ocorre
+       * exatamente no deadline.
        */
       if (
         job.phase === 'main' &&
         job.deadline_at &&
         new Date(
           job.deadline_at
-        ) > now
+        ).getTime() >
+          now.getTime()
       ) {
         nextNotifyAt =
           new Date(
@@ -787,15 +967,18 @@ export async function GET(
           'deadline';
       } else {
         /**
-         * Já passou do deadline.
-         *
-         * Agora repete de acordo
-         * com repeat_minutes.
+         * Após o limite, usamos o intervalo configurado.
          */
-        const repeatMinutes =
+        const rawRepeat =
           Number(
             job.repeat_minutes
-          ) || 30;
+          );
+
+        const repeatMinutes =
+          [10, 15, 30, 45, 60]
+            .includes(rawRepeat)
+            ? rawRepeat
+            : 30;
 
         nextNotifyAt =
           new Date(
@@ -838,16 +1021,14 @@ export async function GET(
           nextPhase,
         ]
       );
-    } catch (error: any) {
+    } catch (error) {
       failed++;
 
       const statusCode =
-        Number(
-          error?.statusCode
-        ) || null;
+        getStatusCode(error);
 
       console.error(
-        '[CRON] Falha ao enviar Web Push:',
+        '[CRON] Erro no Web Push:',
         {
           occurrenceId:
             job.occurrence_id,
@@ -857,7 +1038,7 @@ export async function GET(
 
           statusCode,
 
-          error:
+          message:
             safeErrorMessage(
               error
             ),
@@ -865,20 +1046,19 @@ export async function GET(
       );
 
       /**
-       * ===================================
-       * SUBSCRIPTION EXPIRADA
-       * ===================================
+       * ===================================================
+       * PUSH SUBSCRIPTION EXPIRADA
+       * ===================================================
        *
-       * 404 ou 410 significam que
-       * o endpoint Push não é mais
-       * válido.
+       * 404 ou 410 significa que o navegador não aceita
+       * mais aquela subscription.
        */
 
       if (
         statusCode === 404 ||
         statusCode === 410
       ) {
-        expiredSubscriptions++;
+        expired++;
 
         try {
           await dbPool.query(
@@ -888,8 +1068,7 @@ export async function GET(
               set
                 active = false,
 
-                updated_at =
-                  now()
+                updated_at = now()
 
               where
                 device_id = $1
@@ -926,8 +1105,10 @@ export async function GET(
           databaseError
         ) {
           console.error(
-            '[CRON] Falha ao desativar subscription expirada:',
-            databaseError
+            '[CRON] Falha ao desativar subscription:',
+            safeErrorMessage(
+              databaseError
+            )
           );
         }
 
@@ -935,11 +1116,11 @@ export async function GET(
       }
 
       /**
-       * ===================================
+       * ===================================================
        * ERRO TEMPORÁRIO
-       * ===================================
+       * ===================================================
        *
-       * Reagenda para cinco minutos.
+       * Reagenda em 5 minutos.
        */
 
       try {
@@ -972,22 +1153,30 @@ export async function GET(
         databaseError
       ) {
         console.error(
-          '[CRON] Falha ao reagendar job após erro:',
-          databaseError
+          '[CRON] Não foi possível reagendar o job:',
+          safeErrorMessage(
+            databaseError
+          )
         );
       }
     }
   }
 
   /**
-   * ===================================
-   * 7. RESPOSTA
-   * ===================================
+   * =======================================================
+   * 7. RESULTADO
+   * =======================================================
    */
 
   return NextResponse.json(
     {
       ok: true,
+
+      database:
+        'connected',
+
+      push:
+        'configured',
 
       selected:
         jobs.length,
@@ -998,13 +1187,19 @@ export async function GET(
 
       quiet,
 
-      expiredSubscriptions,
+      expiredSubscriptions:
+        expired,
 
       timestamp:
         new Date().toISOString(),
     },
     {
       status: 200,
+
+      headers: {
+        'Cache-Control':
+          'no-store, max-age=0',
+      },
     }
   );
 }
