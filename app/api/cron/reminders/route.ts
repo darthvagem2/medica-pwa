@@ -1,62 +1,98 @@
 import { NextResponse } from 'next/server';
-import type { PoolClient } from 'pg';
+import type { PoolClient, Pool } from 'pg';
 
 import {
   fromZonedTime,
   toZonedTime,
 } from 'date-fns-tz';
 
-import { pool } from '@/lib/server-db';
+import { getPool } from '@/lib/server-db';
 import { getWebPush } from '@/lib/push-server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+/**
+ * Verifica se o horário local atual está dentro
+ * do período silencioso.
+ */
 function inQuiet(
   now: Date,
   start: string,
   end: string
-) {
-  const mins =
+): boolean {
+  const nowMinutes =
     now.getHours() * 60 +
     now.getMinutes();
 
-  const [sh, sm] =
+  const [startHour, startMinute] =
     start.split(':').map(Number);
 
-  const [eh, em] =
+  const [endHour, endMinute] =
     end.split(':').map(Number);
 
   const startMinutes =
-    sh * 60 + sm;
+    startHour * 60 +
+    startMinute;
 
   const endMinutes =
-    eh * 60 + em;
+    endHour * 60 +
+    endMinute;
 
+  /**
+   * Exemplo:
+   * 22:00 → 23:00
+   */
   if (startMinutes < endMinutes) {
     return (
-      mins >= startMinutes &&
-      mins < endMinutes
+      nowMinutes >= startMinutes &&
+      nowMinutes < endMinutes
     );
   }
 
+  /**
+   * Exemplo:
+   * 23:00 → 07:00
+   */
   return (
-    mins >= startMinutes ||
-    mins < endMinutes
+    nowMinutes >= startMinutes ||
+    nowMinutes < endMinutes
   );
 }
 
+/**
+ * Calcula quando termina o horário silencioso,
+ * respeitando o fuso horário do dispositivo.
+ */
 function quietEndUtc(
   nowUtc: Date,
   timezone: string,
   start: string,
   end: string
-) {
+): Date {
   const local =
-    toZonedTime(nowUtc, timezone);
+    toZonedTime(
+      nowUtc,
+      timezone
+    );
 
   const [endHour, endMinute] =
     end.split(':').map(Number);
+
+  const [startHour, startMinute] =
+    start.split(':').map(Number);
+
+  const nowMinutes =
+    local.getHours() * 60 +
+    local.getMinutes();
+
+  const startMinutes =
+    startHour * 60 +
+    startMinute;
+
+  const endMinutes =
+    endHour * 60 +
+    endMinute;
 
   const target =
     new Date(local);
@@ -68,29 +104,16 @@ function quietEndUtc(
     0
   );
 
-  const [startHour, startMinute] =
-    start.split(':').map(Number);
-
-  const startMinutes =
-    startHour * 60 +
-    startMinute;
-
-  const endMinutes =
-    endHour * 60 +
-    endMinute;
-
-  const nowMinutes =
-    local.getHours() * 60 +
-    local.getMinutes();
-
   /**
    * Exemplo:
    *
    * silencioso:
    * 23:00 → 07:00
    *
-   * Se agora forem 23:30,
-   * o final é 07:00 do dia seguinte.
+   * agora:
+   * 23:30
+   *
+   * o término é amanhã às 07:00.
    */
   if (
     startMinutes >= endMinutes &&
@@ -108,18 +131,22 @@ function quietEndUtc(
 }
 
 /**
- * Evita mandar acidentalmente informações sensíveis
- * para a resposta HTTP caso alguma biblioteca inclua
- * connection strings no erro.
+ * Evita vazar connection strings,
+ * tokens e outros dados sensíveis
+ * nas respostas de diagnóstico.
  */
 function safeErrorMessage(
   error: unknown
 ): string {
-  if (!(error instanceof Error)) {
-    return String(error);
+  let message: string;
+
+  if (error instanceof Error) {
+    message = error.message;
+  } else {
+    message = String(error);
   }
 
-  return error.message
+  return message
     .replace(
       /postgres(?:ql)?:\/\/[^@\s]+@/gi,
       'postgresql://***@'
@@ -130,14 +157,52 @@ function safeErrorMessage(
     );
 }
 
+/**
+ * Tenta executar rollback sem mascarar
+ * o erro original.
+ */
 async function safeRollback(
   client: PoolClient
-) {
+): Promise<void> {
   try {
     await client.query('rollback');
+  } catch (rollbackError) {
+    console.error(
+      '[CRON] Falha ao executar rollback:',
+      rollbackError
+    );
+  }
+}
+
+/**
+ * Libera o lock de um job em caso de falha.
+ */
+async function unlockJob(
+  dbPool: Pool,
+  deviceId: string,
+  occurrenceId: string
+): Promise<void> {
+  try {
+    await dbPool.query(
+      `
+        update reminder_jobs
+
+        set
+          locked_until = null,
+          updated_at = now()
+
+        where
+          device_id = $1
+          and occurrence_id = $2
+      `,
+      [
+        deviceId,
+        occurrenceId,
+      ]
+    );
   } catch (error) {
     console.error(
-      '[CRON] Falha também no rollback:',
+      '[CRON] Falha ao liberar lock:',
       error
     );
   }
@@ -147,18 +212,18 @@ export async function GET(
   req: Request
 ) {
   /**
-   * ============================
+   * ===================================
    * 1. AUTENTICAÇÃO DO CRON
-   * ============================
+   * ===================================
    */
 
-  const secret =
-    process.env.CRON_SECRET;
+  const cronSecret =
+    process.env.CRON_SECRET?.trim();
 
   if (
     process.env.NODE_ENV ===
       'production' &&
-    !secret
+    !cronSecret
   ) {
     return NextResponse.json(
       {
@@ -178,9 +243,9 @@ export async function GET(
     );
 
   if (
-    secret &&
+    cronSecret &&
     authorization !==
-      `Bearer ${secret}`
+      `Bearer ${cronSecret}`
   ) {
     return NextResponse.json(
       {
@@ -194,12 +259,42 @@ export async function GET(
   }
 
   /**
-   * ============================
-   * 2. BANCO
-   * ============================
+   * ===================================
+   * 2. INICIALIZAR POSTGRESQL
+   * ===================================
+   *
+   * Agora usamos getPool().
+   *
+   * Dessa forma o Pool não é criado
+   * automaticamente durante o import
+   * do módulo.
    */
 
-  const dbPool = pool;
+  let dbPool: Pool | null;
+
+  try {
+    dbPool = getPool();
+  } catch (error) {
+    console.error(
+      '[CRON] Falha ao inicializar PostgreSQL:',
+      error
+    );
+
+    return NextResponse.json(
+      {
+        ok: false,
+
+        error:
+          'Falha ao inicializar banco de dados',
+
+        detail:
+          safeErrorMessage(error),
+      },
+      {
+        status: 500,
+      }
+    );
+  }
 
   if (!dbPool) {
     return NextResponse.json(
@@ -215,28 +310,32 @@ export async function GET(
   }
 
   /**
-   * ============================
-   * 3. VAPID / WEB PUSH
-   * ============================
+   * ===================================
+   * 3. INICIALIZAR WEB PUSH / VAPID
+   * ===================================
    */
 
-  let push;
+  let webPush: ReturnType<
+    typeof getWebPush
+  >;
 
   try {
-    push = getWebPush();
+    webPush = getWebPush();
   } catch (error) {
     console.error(
-      '[CRON] Falha ao configurar Web Push:',
+      '[CRON] Falha ao inicializar Web Push:',
       error
     );
 
     return NextResponse.json(
       {
         ok: false,
+
         error:
-          error instanceof Error
-            ? error.message
-            : 'VAPID não configurado',
+          'Falha ao configurar Web Push',
+
+        detail:
+          safeErrorMessage(error),
       },
       {
         status: 503,
@@ -245,15 +344,9 @@ export async function GET(
   }
 
   /**
-   * ============================
-   * 4. CONEXÃO POSTGRESQL
-   * ============================
-   *
-   * ESTE É O PONTO PRINCIPAL
-   * DA CORREÇÃO.
-   *
-   * Antes pool.connect() estava
-   * fora do try/catch.
+   * ===================================
+   * 4. TESTAR CONEXÃO COM POSTGRESQL
+   * ===================================
    */
 
   let client: PoolClient;
@@ -262,9 +355,6 @@ export async function GET(
     client =
       await dbPool.connect();
   } catch (error) {
-    const detail =
-      safeErrorMessage(error);
-
     console.error(
       '[CRON] Falha ao conectar ao PostgreSQL:',
       error
@@ -277,7 +367,8 @@ export async function GET(
         error:
           'Falha ao conectar ao banco de dados',
 
-        detail,
+        detail:
+          safeErrorMessage(error),
       },
       {
         status: 500,
@@ -286,58 +377,68 @@ export async function GET(
   }
 
   /**
-   * ============================
-   * 5. SELECIONAR JOBS
-   * ============================
+   * ===================================
+   * 5. BUSCAR JOBS VENCIDOS
+   * ===================================
    */
 
   let jobs: any[] = [];
 
   try {
-    await client.query('begin');
+    await client.query(
+      'begin'
+    );
 
-    const selected =
-      await client.query(`
-        select
-          j.*,
-          d.subscription,
-          d.timezone,
-          d.quiet_enabled,
-          d.quiet_start,
-          d.quiet_end
+    const result =
+      await client.query(
+        `
+          select
+            j.*,
 
-        from reminder_jobs j
+            d.subscription,
+            d.timezone,
+            d.quiet_enabled,
+            d.quiet_start,
+            d.quiet_end
 
-        join push_devices d
-          on d.device_id = j.device_id
+          from reminder_jobs j
 
-        where
-          j.active = true
+          inner join push_devices d
+            on d.device_id =
+               j.device_id
 
-          and d.active = true
+          where
+            j.active = true
 
-          and j.next_notify_at <= now()
+            and d.active = true
 
-          and (
-            j.locked_until is null
-            or j.locked_until < now()
-          )
+            and j.next_notify_at
+              <= now()
 
-        order by
-          j.next_notify_at asc
+            and (
+              j.locked_until is null
 
-        for update of j
-        skip locked
+              or
+              j.locked_until < now()
+            )
 
-        limit 100
-      `);
+          order by
+            j.next_notify_at asc
 
-    jobs = selected.rows;
+          for update of j
+          skip locked
+
+          limit 100
+        `
+      );
+
+    jobs = result.rows;
 
     /**
-     * Lock temporário para impedir
-     * dois workers de enviarem a
-     * mesma notificação simultaneamente.
+     * Reserva os jobs por dois minutos.
+     *
+     * Isso reduz a chance de dois workers
+     * enviarem o mesmo lembrete.
      */
     for (const job of jobs) {
       await client.query(
@@ -346,13 +447,15 @@ export async function GET(
 
           set
             locked_until =
-              now() + interval '2 minutes',
+              now()
+              + interval '2 minutes',
 
             updated_at =
               now()
 
           where
             device_id = $1
+
             and occurrence_id = $2
         `,
         [
@@ -371,7 +474,7 @@ export async function GET(
     );
 
     console.error(
-      '[CRON] Erro ao selecionar reminder_jobs:',
+      '[CRON] Falha ao consultar reminder_jobs:',
       error
     );
 
@@ -394,105 +497,149 @@ export async function GET(
   }
 
   /**
-   * ============================
-   * 6. ENVIAR NOTIFICAÇÕES
-   * ============================
+   * ===================================
+   * 6. PROCESSAR JOBS
+   * ===================================
    */
 
   let sent = 0;
   let failed = 0;
   let quiet = 0;
+  let expiredSubscriptions = 0;
 
   for (const job of jobs) {
     const now =
       new Date();
 
     const timezone =
-      job.timezone || 'UTC';
+      job.timezone ||
+      'UTC';
 
     /**
-     * ============================
+     * ===================================
      * HORÁRIO SILENCIOSO
-     * ============================
+     * ===================================
      */
 
     if (
-      job.quiet_enabled &&
-      inQuiet(
+      job.quiet_enabled === true &&
+      job.quiet_start &&
+      job.quiet_end
+    ) {
+      const localNow =
         toZonedTime(
           now,
           timezone
-        ),
-        job.quiet_start,
-        job.quiet_end
-      )
-    ) {
-      try {
-        await dbPool.query(
-          `
-            update reminder_jobs
+        );
 
-            set
-              next_notify_at = $3,
-              locked_until = null,
-              updated_at = now()
+      const isQuiet =
+        inQuiet(
+          localNow,
+          job.quiet_start,
+          job.quiet_end
+        );
 
-            where
-              device_id = $1
-              and occurrence_id = $2
-          `,
-          [
-            job.device_id,
-            job.occurrence_id,
-
+      if (isQuiet) {
+        try {
+          const resumeAt =
             quietEndUtc(
               now,
               timezone,
               job.quiet_start,
               job.quiet_end
-            ),
-          ]
-        );
+            );
 
-        quiet++;
-      } catch (error) {
-        console.error(
-          '[CRON] Falha ao adiar job por horário silencioso:',
-          job.occurrence_id,
-          error
-        );
+          await dbPool.query(
+            `
+              update reminder_jobs
 
-        failed++;
+              set
+                next_notify_at = $3,
+
+                locked_until =
+                  null,
+
+                updated_at =
+                  now()
+
+              where
+                device_id = $1
+
+                and occurrence_id = $2
+            `,
+            [
+              job.device_id,
+              job.occurrence_id,
+              resumeAt,
+            ]
+          );
+
+          quiet++;
+
+          continue;
+        } catch (error) {
+          failed++;
+
+          console.error(
+            '[CRON] Falha ao adiar lembrete por horário silencioso:',
+            {
+              occurrenceId:
+                job.occurrence_id,
+
+              error:
+                safeErrorMessage(
+                  error
+                ),
+            }
+          );
+
+          await unlockJob(
+            dbPool,
+            job.device_id,
+            job.occurrence_id
+          );
+
+          continue;
+        }
       }
-
-      continue;
     }
 
     /**
-     * Verifica se já passou do
-     * horário limite.
+     * ===================================
+     * DEFINIR TIPO DO ALERTA
+     * ===================================
      */
-    const overdue =
+
+    const deadlinePassed =
       Boolean(
         job.deadline_at &&
-          new Date(
-            job.deadline_at
-          ) <= now
-      ) ||
+        new Date(
+          job.deadline_at
+        ) <= now
+      );
+
+    const overdue =
+      deadlinePassed ||
       job.phase ===
         'deadline' ||
       job.phase ===
         'repeat';
 
+    const title =
+      overdue
+        ? '⚠️ Medicamento ainda não confirmado'
+        : 'Hora do medicamento';
+
+    const body =
+      overdue
+        ? `Você ainda não marcou ${job.medication_label} como tomado.`
+        : `Está na hora de ${job.medication_label}.`;
+
     const payload =
       JSON.stringify({
-        title: overdue
-          ? '⚠️ Medicamento ainda não confirmado'
-          : 'Hora do medicamento',
+        title,
 
-        body: overdue
-          ? `Você ainda não marcou ${job.medication_label} como tomado.`
-          : `Está na hora de ${job.medication_label}.`,
+        body,
 
         tag:
           `med-${job.occurrence_id}`,
@@ -500,25 +647,57 @@ export async function GET(
         url:
           job.url || '/',
 
+        occurrenceId:
+          job.occurrence_id,
+
+        medicationId:
+          job.medication_id,
+
+        overdue,
+
         requireInteraction:
           overdue,
 
         vibration:
-          job.vibration,
+          Boolean(
+            job.vibration
+          ),
 
         sound:
-          job.sound,
+          Boolean(
+            job.sound
+          ),
       });
 
-    try {
-      /**
-       * ============================
-       * ENVIO WEB PUSH
-       * ============================
-       */
+    /**
+     * ===================================
+     * ENVIAR WEB PUSH
+     * ===================================
+     */
 
-      await push.sendNotification(
-        job.subscription,
+    try {
+      let subscription =
+        job.subscription;
+
+      /**
+       * PostgreSQL/jsonb normalmente
+       * já devolve objeto.
+       *
+       * Mas aceitamos string também
+       * para maior robustez.
+       */
+      if (
+        typeof subscription ===
+        'string'
+      ) {
+        subscription =
+          JSON.parse(
+            subscription
+          );
+      }
+
+      await webPush.sendNotification(
+        subscription,
         payload,
         {
           TTL: 300,
@@ -528,14 +707,18 @@ export async function GET(
       sent++;
 
       /**
-       * Medicamentos opcionais:
+       * ===================================
+       * MEDICAMENTO OPCIONAL
+       * ===================================
        *
+       * Se não for obrigatório,
        * depois do lembrete principal
-       * não precisam ficar repetindo.
+       * encerramos este job.
        */
+
       if (
         job.phase === 'main' &&
-        !job.required
+        job.required === false
       ) {
         await dbPool.query(
           `
@@ -543,13 +726,21 @@ export async function GET(
 
             set
               active = false,
+
               phase = 'done',
-              last_sent_at = now(),
-              locked_until = null,
-              updated_at = now()
+
+              last_sent_at =
+                now(),
+
+              locked_until =
+                null,
+
+              updated_at =
+                now()
 
             where
               device_id = $1
+
               and occurrence_id = $2
           `,
           [
@@ -562,7 +753,9 @@ export async function GET(
       }
 
       /**
-       * Calcula o próximo lembrete.
+       * ===================================
+       * CALCULAR PRÓXIMO ALERTA
+       * ===================================
        */
 
       let nextNotifyAt: Date;
@@ -571,6 +764,13 @@ export async function GET(
         | 'deadline'
         | 'repeat';
 
+      /**
+       * Primeiro alerta ocorreu
+       * antes do horário limite.
+       *
+       * O próximo será exatamente
+       * no deadline.
+       */
       if (
         job.phase === 'main' &&
         job.deadline_at &&
@@ -578,14 +778,6 @@ export async function GET(
           job.deadline_at
         ) > now
       ) {
-        /**
-         * Exemplo:
-         *
-         * medicamento 08:00
-         * limite 09:00
-         *
-         * próximo evento = 09:00
-         */
         nextNotifyAt =
           new Date(
             job.deadline_at
@@ -595,12 +787,10 @@ export async function GET(
           'deadline';
       } else {
         /**
-         * Depois do limite:
+         * Já passou do deadline.
          *
-         * 09:00
-         * 09:30
-         * 10:00
-         * ...
+         * Agora repete de acordo
+         * com repeat_minutes.
          */
         const repeatMinutes =
           Number(
@@ -624,13 +814,21 @@ export async function GET(
 
           set
             next_notify_at = $3,
+
             phase = $4,
-            last_sent_at = now(),
-            locked_until = null,
-            updated_at = now()
+
+            last_sent_at =
+              now(),
+
+            locked_until =
+              null,
+
+            updated_at =
+              now()
 
           where
             device_id = $1
+
             and occurrence_id = $2
         `,
         [
@@ -643,8 +841,13 @@ export async function GET(
     } catch (error: any) {
       failed++;
 
+      const statusCode =
+        Number(
+          error?.statusCode
+        ) || null;
+
       console.error(
-        '[CRON] Falha no job:',
+        '[CRON] Falha ao enviar Web Push:',
         {
           occurrenceId:
             job.occurrence_id,
@@ -652,10 +855,9 @@ export async function GET(
           medicationId:
             job.medication_id,
 
-          statusCode:
-            error?.statusCode,
+          statusCode,
 
-          message:
+          error:
             safeErrorMessage(
               error
             ),
@@ -663,17 +865,21 @@ export async function GET(
       );
 
       /**
-       * 404 ou 410:
+       * ===================================
+       * SUBSCRIPTION EXPIRADA
+       * ===================================
        *
-       * subscription Push expirou
-       * ou foi removida pelo navegador.
+       * 404 ou 410 significam que
+       * o endpoint Push não é mais
+       * válido.
        */
+
       if (
-        error?.statusCode ===
-          404 ||
-        error?.statusCode ===
-          410
+        statusCode === 404 ||
+        statusCode === 410
       ) {
+        expiredSubscriptions++;
+
         try {
           await dbPool.query(
             `
@@ -681,7 +887,9 @@ export async function GET(
 
               set
                 active = false,
-                updated_at = now()
+
+                updated_at =
+                  now()
 
               where
                 device_id = $1
@@ -696,11 +904,17 @@ export async function GET(
               update reminder_jobs
 
               set
-                locked_until = null,
-                updated_at = now()
+                active = false,
+
+                locked_until =
+                  null,
+
+                updated_at =
+                  now()
 
               where
                 device_id = $1
+
                 and occurrence_id = $2
             `,
             [
@@ -712,7 +926,7 @@ export async function GET(
           databaseError
         ) {
           console.error(
-            '[CRON] Falha ao desativar subscription inválida:',
+            '[CRON] Falha ao desativar subscription expirada:',
             databaseError
           );
         }
@@ -721,9 +935,11 @@ export async function GET(
       }
 
       /**
-       * Qualquer outro erro:
+       * ===================================
+       * ERRO TEMPORÁRIO
+       * ===================================
        *
-       * tenta novamente em 5 minutos.
+       * Reagenda para cinco minutos.
        */
 
       try {
@@ -733,15 +949,18 @@ export async function GET(
 
             set
               next_notify_at =
-                now() + interval '5 minutes',
+                now()
+                + interval '5 minutes',
 
-              locked_until = null,
+              locked_until =
+                null,
 
               updated_at =
                 now()
 
             where
               device_id = $1
+
               and occurrence_id = $2
           `,
           [
@@ -753,7 +972,7 @@ export async function GET(
         databaseError
       ) {
         console.error(
-          '[CRON] Falha ao reagendar job:',
+          '[CRON] Falha ao reagendar job após erro:',
           databaseError
         );
       }
@@ -761,24 +980,31 @@ export async function GET(
   }
 
   /**
-   * ============================
-   * 7. RESPOSTA FINAL
-   * ============================
+   * ===================================
+   * 7. RESPOSTA
+   * ===================================
    */
 
-  return NextResponse.json({
-    ok: true,
+  return NextResponse.json(
+    {
+      ok: true,
 
-    selected:
-      jobs.length,
+      selected:
+        jobs.length,
 
-    sent,
+      sent,
 
-    failed,
+      failed,
 
-    quiet,
+      quiet,
 
-    timestamp:
-      new Date().toISOString(),
-  });
+      expiredSubscriptions,
+
+      timestamp:
+        new Date().toISOString(),
+    },
+    {
+      status: 200,
+    }
+  );
 }
