@@ -24,6 +24,8 @@ import {
 
 import type {
   AppSettings,
+  Medication,
+  MedicationLog,
 } from '@/lib/types';
 
 import {
