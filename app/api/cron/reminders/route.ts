@@ -2,101 +2,71 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function reply(body: unknown, status = 200) {
-  return new Response(
-    JSON.stringify(body, null, 2),
-    {
-      status,
-      headers: {
-        'content-type': 'application/json; charset=utf-8',
-        'cache-control': 'no-store',
-      },
-    }
-  );
-}
-
 export async function GET(request: Request) {
-  try {
-    const secret =
-      process.env.CRON_SECRET?.trim();
+  const secret =
+    process.env.CRON_SECRET?.trim();
 
-    if (!secret) {
-      return reply(
-        {
-          ok: false,
-          stage: 'cron-secret',
-          error: 'CRON_SECRET ausente',
+  if (!secret) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        version: 'ENV_ONLY_V1',
+        stage: 'cron-secret',
+        error: 'CRON_SECRET ausente',
+      }),
+      {
+        status: 503,
+        headers: {
+          'content-type': 'application/json',
+          'cache-control': 'no-store',
         },
-        503
-      );
-    }
+      }
+    );
+  }
 
-    if (
-      request.headers.get('authorization') !==
-      `Bearer ${secret}`
-    ) {
-      return reply(
-        {
-          ok: false,
-          stage: 'authorization',
-          error: 'Unauthorized',
+  const authorization =
+    request.headers.get('authorization');
+
+  if (
+    authorization !==
+    `Bearer ${secret}`
+  ) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        version: 'ENV_ONLY_V1',
+        stage: 'authorization',
+        error: 'Unauthorized',
+      }),
+      {
+        status: 401,
+        headers: {
+          'content-type': 'application/json',
+          'cache-control': 'no-store',
         },
-        401
-      );
-    }
+      }
+    );
+  }
 
-    const databaseUrl =
-      process.env.DATABASE_URL?.trim();
-
-    if (!databaseUrl) {
-      return reply(
-        {
-          ok: false,
-          stage: 'database-url',
-          error: 'DATABASE_URL ausente',
-        },
-        503
-      );
-    }
-
-    let parsed: URL;
-
-    try {
-      parsed =
-        new URL(databaseUrl);
-    } catch {
-      return reply(
-        {
-          ok: false,
-          stage: 'database-url-format',
-          error: 'DATABASE_URL inválida',
-        },
-        500
-      );
-    }
-
-    return reply({
+  return new Response(
+    JSON.stringify({
       ok: true,
-      stage: 'environment-ok',
 
-      database: {
-        username:
-          decodeURIComponent(
-            parsed.username
-          ),
+      version:
+        'ENV_ONLY_V1',
 
-        host:
-          parsed.hostname,
-
-        port:
-          parsed.port || 'default',
-
-        database:
-          parsed.pathname,
-      },
+      stage:
+        'environment-ok',
 
       environment: {
-        databaseUrl: true,
+        databaseUrl:
+          Boolean(
+            process.env.DATABASE_URL
+          ),
+
+        databaseUrlLength:
+          process.env.DATABASE_URL
+            ?.length ?? 0,
 
         vapidPublic:
           Boolean(
@@ -116,19 +86,17 @@ export async function GET(request: Request) {
               .VAPID_SUBJECT
           ),
       },
-    });
-  } catch (error) {
-    return reply(
-      {
-        ok: false,
-        stage: 'unhandled',
+    }),
+    {
+      status: 200,
 
-        detail:
-          error instanceof Error
-            ? error.message
-            : String(error),
+      headers: {
+        'content-type':
+          'application/json; charset=utf-8',
+
+        'cache-control':
+          'no-store',
       },
-      500
-    );
-  }
+    }
+  );
 }
