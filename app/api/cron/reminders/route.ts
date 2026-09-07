@@ -17,12 +17,8 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-/* =========================================================
-   VERSÃO
-========================================================= */
-
 const CRON_VERSION =
-  'SUPABASE_CRON_V1';
+  'SUPABASE_CRON_V2_PUSH_DEBUG';
 
 /* =========================================================
    TIPOS
@@ -35,78 +31,92 @@ type ReminderPhase =
   | 'done';
 
 type PushDeviceRow = {
-  subscription:
-    unknown;
+  subscription: unknown;
 
   timezone:
-    string | null;
+    | string
+    | null;
 
   quiet_enabled:
-    boolean | null;
+    | boolean
+    | null;
 
   quiet_start:
-    string | null;
+    | string
+    | null;
 
   quiet_end:
-    string | null;
+    | string
+    | null;
 
   active:
-    boolean | null;
+    | boolean
+    | null;
 };
 
 type ReminderJobRow = {
-  device_id:
-    string;
+  device_id: string;
 
-  occurrence_id:
-    string;
+  occurrence_id: string;
 
-  medication_id:
-    string;
+  medication_id: string;
 
-  medication_label:
-    string;
+  medication_label: string;
 
-  scheduled_at:
-    string;
+  scheduled_at: string;
 
   deadline_at:
-    string | null;
+    | string
+    | null;
 
-  next_notify_at:
-    string;
+  next_notify_at: string;
 
-  repeat_minutes:
-    number;
+  repeat_minutes: number;
 
-  phase:
-    ReminderPhase;
+  phase: ReminderPhase;
 
-  sound:
-    boolean;
+  sound: boolean;
 
-  vibration:
-    boolean;
+  vibration: boolean;
 
-  required:
-    boolean;
+  required: boolean;
 
   url:
-    string | null;
+    | string
+    | null;
 
-  active:
-    boolean;
+  active: boolean;
 
   last_sent_at:
-    string | null;
+    | string
+    | null;
 
   locked_until:
-    string | null;
+    | string
+    | null;
 
   push_devices:
     | PushDeviceRow
     | PushDeviceRow[]
     | null;
+};
+
+type PushErrorDiagnostic = {
+  occurrenceId: string;
+
+  medicationLabel: string;
+
+  statusCode:
+    | number
+    | null;
+
+  message: string;
+
+  reason:
+    | string
+    | null;
+
+  body: unknown;
 };
 
 /* =========================================================
@@ -144,36 +154,47 @@ function reply(
 function safeError(
   error: unknown
 ): string {
+  let message: string;
+
   if (
     error instanceof Error
   ) {
-    return error.message
-      .replace(
-        /Bearer\s+\S+/gi,
-        'Bearer ***'
-      )
-      .replace(
-        /sb_secret_[A-Za-z0-9_-]+/gi,
-        'sb_secret_***'
-      );
-  }
-
-  if (
-    typeof error === 'string'
+    message =
+      error.message;
+  } else if (
+    typeof error ===
+    'string'
   ) {
-    return error;
+    message =
+      error;
+  } else {
+    try {
+      message =
+        JSON.stringify(
+          error
+        );
+    } catch {
+      message =
+        String(
+          error
+        );
+    }
   }
 
-  try {
-    return JSON.stringify(
-      error
+  return message
+    .replace(
+      /Bearer\s+\S+/gi,
+      'Bearer ***'
+    )
+    .replace(
+      /sb_secret_[A-Za-z0-9_-]+/gi,
+      'sb_secret_***'
     );
-  } catch {
-    return String(
-      error
-    );
-  }
 }
+
+/* =========================================================
+   STATUS HTTP DO WEB PUSH
+========================================================= */
 
 function getPushStatusCode(
   error: unknown
@@ -201,6 +222,159 @@ function getPushStatusCode(
   )
     ? status
     : null;
+}
+
+/* =========================================================
+   BODY DO ERRO WEB PUSH
+
+   A Apple normalmente devolve algo como:
+
+   {
+     "reason": "VapidPkHashMismatch"
+   }
+
+   ou
+
+   {
+     "reason": "BadJwtToken"
+   }
+========================================================= */
+
+function getPushErrorBody(
+  error: unknown
+): unknown {
+  if (
+    typeof error !==
+      'object' ||
+    error === null
+  ) {
+    return null;
+  }
+
+  const raw =
+    error as {
+      body?: unknown;
+    };
+
+  const body =
+    raw.body;
+
+  if (
+    body === undefined ||
+    body === null
+  ) {
+    return null;
+  }
+
+  /*
+   * web-push normalmente
+   * devolve body como string.
+   */
+  if (
+    typeof body ===
+    'string'
+  ) {
+    const trimmed =
+      body.trim();
+
+    if (!trimmed) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(
+        trimmed
+      );
+    } catch {
+      return trimmed;
+    }
+  }
+
+  /*
+   * Também aceita Buffer /
+   * Uint8Array caso a biblioteca
+   * devolva bytes.
+   */
+  if (
+    body instanceof
+    Uint8Array
+  ) {
+    try {
+      const text =
+        Buffer
+          .from(body)
+          .toString(
+            'utf8'
+          )
+          .trim();
+
+      if (!text) {
+        return null;
+      }
+
+      try {
+        return JSON.parse(
+          text
+        );
+      } catch {
+        return text;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  return body;
+}
+
+/* =========================================================
+   EXTRAIR "reason"
+========================================================= */
+
+function getPushErrorReason(
+  body: unknown
+): string | null {
+  if (
+    typeof body ===
+      'object' &&
+    body !== null
+  ) {
+    const raw =
+      body as {
+        reason?: unknown;
+      };
+
+    if (
+      typeof raw.reason ===
+        'string' &&
+      raw.reason.trim()
+    ) {
+      return raw.reason
+        .trim();
+    }
+  }
+
+  /*
+   * Caso o body tenha vindo
+   * como texto.
+   */
+  if (
+    typeof body ===
+      'string'
+  ) {
+    const match =
+      body.match(
+        /"reason"\s*:\s*"([^"]+)"/i
+      );
+
+    if (
+      match?.[1]
+    ) {
+      return match[1];
+    }
+  }
+
+  return null;
 }
 
 /* =========================================================
@@ -249,52 +423,60 @@ function parseSubscription(
       };
     };
 
-  if (
-    typeof raw.endpoint !==
-      'string' ||
-    !raw.endpoint.trim()
-  ) {
+  const endpoint =
+    typeof raw.endpoint ===
+      'string'
+      ? raw.endpoint.trim()
+      : '';
+
+  const p256dh =
+    typeof raw.keys
+      ?.p256dh ===
+      'string'
+      ? raw.keys
+          .p256dh
+          .trim()
+      : '';
+
+  const auth =
+    typeof raw.keys
+      ?.auth ===
+      'string'
+      ? raw.keys
+          .auth
+          .trim()
+      : '';
+
+  if (!endpoint) {
     throw new Error(
       'Subscription sem endpoint.'
     );
   }
 
-  if (
-    typeof raw.keys?.p256dh !==
-      'string' ||
-    !raw.keys.p256dh.trim()
-  ) {
+  if (!p256dh) {
     throw new Error(
       'Subscription sem p256dh.'
     );
   }
 
-  if (
-    typeof raw.keys.auth !==
-      'string' ||
-    !raw.keys.auth.trim()
-  ) {
+  if (!auth) {
     throw new Error(
       'Subscription sem auth.'
     );
   }
 
   return {
-    endpoint:
-      raw.endpoint,
+    endpoint,
 
     keys: {
-      p256dh:
-        raw.keys.p256dh,
-
-      auth:
-        raw.keys.auth,
+      p256dh,
+      auth,
     },
   };
 }
 
 /* =========================================================
-   DEVICE EMBED
+   DEVICE DO JOIN
 ========================================================= */
 
 function getDevice(
@@ -306,7 +488,8 @@ function getDevice(
     )
   ) {
     return (
-      job.push_devices[0] ??
+      job
+        .push_devices[0] ??
       null
     );
   }
@@ -390,11 +573,13 @@ function isInQuietHours(
       .map(Number);
 
   const startMinutes =
-    startHour * 60 +
+    startHour *
+      60 +
     startMinute;
 
   const endMinutes =
-    endHour * 60 +
+    endHour *
+      60 +
     endMinute;
 
   if (
@@ -461,11 +646,13 @@ function quietEndUtc(
       .map(Number);
 
   const startMinutes =
-    startHour * 60 +
+    startHour *
+      60 +
     startMinute;
 
   const endMinutes =
-    endHour * 60 +
+    endHour *
+      60 +
     endMinute;
 
   const current =
@@ -485,13 +672,6 @@ function quietEndUtc(
     0
   );
 
-  /*
-   * Janela atravessa meia-noite:
-   * 23:00 → 07:00.
-   *
-   * Se agora for 23:30,
-   * 07:00 é amanhã.
-   */
   if (
     startMinutes >
       endMinutes &&
@@ -519,7 +699,7 @@ export async function GET(
 ) {
   try {
     /* =====================================================
-       1. AUTORIZAÇÃO DO CRON
+       1. AUTORIZAÇÃO
     ===================================================== */
 
     const cronSecret =
@@ -545,10 +725,13 @@ export async function GET(
       );
     }
 
-    if (
+    const authorization =
       request.headers.get(
         'authorization'
-      ) !==
+      );
+
+    if (
+      authorization !==
       `Bearer ${cronSecret}`
     ) {
       return reply(
@@ -569,7 +752,7 @@ export async function GET(
     }
 
     /* =====================================================
-       2. SUPABASE ENV
+       2. SUPABASE
     ===================================================== */
 
     const supabaseUrl =
@@ -620,29 +803,33 @@ export async function GET(
       );
     }
 
-    /* =====================================================
-       3. CRIAR CLIENTE SUPABASE
-    ===================================================== */
-const supabase = createClient(
-  supabaseUrl,
-  supabaseSecretKey,
-  {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-      detectSessionInUrl: false,
-    },
+    const supabase =
+      createClient<any>(
+        supabaseUrl,
+        supabaseSecretKey,
+        {
+          auth: {
+            persistSession:
+              false,
 
-    global: {
-      headers: {
-        'X-Client-Info': 'medica-pwa-cron',
-      },
-    },
-  }
-);
-   
+            autoRefreshToken:
+              false,
+
+            detectSessionInUrl:
+              false,
+          },
+
+          global: {
+            headers: {
+              'X-Client-Info':
+                'medica-pwa-cron',
+            },
+          },
+        }
+      );
+
     /* =====================================================
-       4. TESTAR SUPABASE
+       3. TESTAR SUPABASE
     ===================================================== */
 
     const {
@@ -683,13 +870,13 @@ const supabase = createClient(
           error:
             'Falha ao acessar push_devices.',
 
-          detail:
-            connectionError
-              .message,
-
           code:
             connectionError
               .code,
+
+          detail:
+            connectionError
+              .message,
 
           hint:
             connectionError
@@ -700,7 +887,7 @@ const supabase = createClient(
     }
 
     /* =====================================================
-       5. VAPID
+       4. VAPID
     ===================================================== */
 
     let webPush:
@@ -735,7 +922,7 @@ const supabase = createClient(
     }
 
     /* =====================================================
-       6. BUSCAR JOBS VENCIDOS
+       5. BUSCAR JOBS VENCIDOS
     ===================================================== */
 
     const now =
@@ -773,7 +960,6 @@ const supabase = createClient(
             active,
             last_sent_at,
             locked_until,
-
             push_devices!inner (
               subscription,
               timezone,
@@ -807,7 +993,9 @@ const supabase = createClient(
           100
         );
 
-    if (jobsError) {
+    if (
+      jobsError
+    ) {
       return reply(
         {
           ok: false,
@@ -822,13 +1010,16 @@ const supabase = createClient(
             'Falha ao consultar reminder_jobs.',
 
           code:
-            jobsError.code,
+            jobsError
+              .code,
 
           detail:
-            jobsError.message,
+            jobsError
+              .message,
 
           hint:
-            jobsError.hint,
+            jobsError
+              .hint,
         },
         500
       );
@@ -842,10 +1033,12 @@ const supabase = createClient(
         ReminderJobRow[];
 
     /* =====================================================
-       7. CONTADORES
+       6. CONTADORES
     ===================================================== */
 
-    let selected = 0;
+    const selected =
+      jobs.length;
+
     let claimed = 0;
     let sent = 0;
     let failed = 0;
@@ -853,11 +1046,21 @@ const supabase = createClient(
     let expired = 0;
     let skippedLocked = 0;
 
-    selected =
-      jobs.length;
+    /*
+     * Mantemos os erros desta execução
+     * para aparecerem diretamente no JSON.
+     */
+    const pushErrors:
+      PushErrorDiagnostic[] =
+      [];
+
+    let lastPushError:
+      PushErrorDiagnostic |
+      null =
+      null;
 
     /* =====================================================
-       8. PROCESSAR JOBS
+       7. PROCESSAR JOBS
     ===================================================== */
 
     for (
@@ -871,7 +1074,7 @@ const supabase = createClient(
           .toISOString();
 
       /* ===================================================
-         8.1 IGNORAR LOCK ATIVO
+         7.1 LOCK EXISTENTE
       =================================================== */
 
       if (
@@ -896,10 +1099,7 @@ const supabase = createClient(
       }
 
       /* ===================================================
-         8.2 CLAIM / LOCK
-
-         Evita duas execuções simultâneas enviarem
-         o mesmo lembrete.
+         7.2 CLAIM
       =================================================== */
 
       const lockUntil =
@@ -961,7 +1161,9 @@ const supabase = createClient(
             'occurrence_id'
           );
 
-      if (claimError) {
+      if (
+        claimError
+      ) {
         failed++;
 
         console.error(
@@ -984,14 +1186,14 @@ const supabase = createClient(
 
       claimed++;
 
+      /* ===================================================
+         7.3 DEVICE
+      =================================================== */
+
       const device =
         getDevice(
           job
         );
-
-      /* ===================================================
-         8.3 DEVICE AUSENTE
-      =================================================== */
 
       if (
         !device ||
@@ -1028,13 +1230,12 @@ const supabase = createClient(
       const timezone =
         typeof device.timezone ===
           'string' &&
-        device.timezone
-          .trim()
+        device.timezone.trim()
           ? device.timezone
           : 'UTC';
 
       /* ===================================================
-         8.4 QUIET HOURS
+         7.4 QUIET HOURS
       =================================================== */
 
       if (
@@ -1116,13 +1317,15 @@ const supabase = createClient(
         } catch (error) {
           console.error(
             '[CRON] Quiet hours inválido:',
-            error
+            safeError(
+              error
+            )
           );
         }
       }
 
       /* ===================================================
-         8.5 DETERMINAR ATRASO
+         7.5 DEADLINE
       =================================================== */
 
       const deadline =
@@ -1139,7 +1342,8 @@ const supabase = createClient(
             deadline.getTime()
           ) &&
           deadline.getTime() <=
-            iterationNow.getTime()
+            iterationNow
+              .getTime()
         );
 
       const overdue =
@@ -1150,7 +1354,7 @@ const supabase = createClient(
           'repeat';
 
       /* ===================================================
-         8.6 PAYLOAD
+         7.6 PAYLOAD
       =================================================== */
 
       const payload =
@@ -1193,7 +1397,7 @@ const supabase = createClient(
         });
 
       /* ===================================================
-         8.7 ENVIAR WEB PUSH
+         7.7 ENVIAR PUSH
       =================================================== */
 
       try {
@@ -1215,7 +1419,7 @@ const supabase = createClient(
 
         /* =================================================
            NÃO OBRIGATÓRIO:
-           envia uma vez e encerra.
+           ENVIA UMA VEZ
         ================================================= */
 
         if (
@@ -1409,24 +1613,67 @@ const supabase = createClient(
       } catch (error) {
         failed++;
 
+        /* ===============================================
+           DIAGNÓSTICO COMPLETO DO PUSH
+        =============================================== */
+
         const statusCode =
           getPushStatusCode(
             error
           );
 
-        console.error(
-          '[CRON] Web Push falhou:',
+        const pushErrorBody =
+          getPushErrorBody(
+            error
+          );
+
+        const pushReason =
+          getPushErrorReason(
+            pushErrorBody
+          );
+
+        const diagnostic:
+          PushErrorDiagnostic =
           {
             occurrenceId:
               job.occurrence_id,
 
+            medicationLabel:
+              job.medication_label,
+
             statusCode,
 
-            error:
+            message:
               safeError(
                 error
               ),
-          }
+
+            reason:
+              pushReason,
+
+            body:
+              pushErrorBody,
+          };
+
+        lastPushError =
+          diagnostic;
+
+        /*
+         * Máximo 10 para não
+         * criar resposta gigantesca.
+         */
+        if (
+          pushErrors.length <
+            10
+        ) {
+          pushErrors.push(
+            diagnostic
+          );
+        }
+
+        console.error(
+          '[CRON] Web Push falhou:',
+          diagnostic
         );
 
         /* =================================================
@@ -1483,7 +1730,7 @@ const supabase = createClient(
 
         /* =================================================
            ERRO TEMPORÁRIO:
-           tentar novamente em 5 minutos
+           TENTAR NOVAMENTE EM 5 MINUTOS
         ================================================= */
 
         const retryAt =
@@ -1492,35 +1739,48 @@ const supabase = createClient(
               5 * 60_000
           );
 
-        await supabase
-          .from(
-            'reminder_jobs'
-          )
-          .update({
-            next_notify_at:
-              retryAt
-                .toISOString(),
+        const {
+          error:
+            retryError,
+        } =
+          await supabase
+            .from(
+              'reminder_jobs'
+            )
+            .update({
+              next_notify_at:
+                retryAt
+                  .toISOString(),
 
-            locked_until:
-              null,
+              locked_until:
+                null,
 
-            updated_at:
-              new Date()
-                .toISOString(),
-          })
-          .eq(
-            'device_id',
-            job.device_id
-          )
-          .eq(
-            'occurrence_id',
-            job.occurrence_id
+              updated_at:
+                new Date()
+                  .toISOString(),
+            })
+            .eq(
+              'device_id',
+              job.device_id
+            )
+            .eq(
+              'occurrence_id',
+              job.occurrence_id
+            );
+
+        if (
+          retryError
+        ) {
+          console.error(
+            '[CRON] Falha ao reagendar após erro Push:',
+            retryError
           );
+        }
       }
     }
 
     /* =====================================================
-       9. SUCESSO
+       8. RESULTADO
     ===================================================== */
 
     return reply({
@@ -1551,6 +1811,18 @@ const supabase = createClient(
       sent,
 
       failed,
+
+      /*
+       * ESTE É O CAMPO PRINCIPAL
+       * QUE QUEREMOS VER.
+       */
+      lastPushError,
+
+      /*
+       * Caso mais de um lembrete
+       * falhe na mesma execução.
+       */
+      pushErrors,
 
       quiet,
 
