@@ -4,22 +4,35 @@ import { addDays } from 'date-fns';
 
 import { db } from './db';
 import { buildOccurrences } from './domain';
-import type { ReminderJobPayload } from './types';
+
+import type {
+  DeviceState,
+  ReminderJobPayload,
+} from './types';
 
 /* =========================================================
-   SERVICE WORKER
+   CACHE
 ========================================================= */
 
-/**
- * Mantemos o registration em memória.
- *
- * Isso é especialmente importante no iPhone:
- * no segundo toque do usuário precisamos conseguir chamar
- * pushManager.subscribe() imediatamente, sem esperar
- * navigator.serviceWorker.ready.
- */
 let cachedServiceWorkerRegistration:
   ServiceWorkerRegistration | null = null;
+
+let cachedPushSubscription:
+  PushSubscription | null = null;
+
+/* =========================================================
+   TIPOS
+========================================================= */
+
+type SerializedPushSubscription = {
+  endpoint: string;
+  expirationTime: number | null;
+
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+};
 
 /* =========================================================
    HELPERS
@@ -78,15 +91,146 @@ function unknownErrorMessage(
   return fallback;
 }
 
-/**
- * Converte a chave pública VAPID Base64 URL-safe
- * para Uint8Array.
- */
+function randomHex(
+  byteLength: number
+): string {
+  const bytes =
+    new Uint8Array(
+      byteLength
+    );
+
+  crypto.getRandomValues(
+    bytes
+  );
+
+  return Array.from(
+    bytes,
+    (byte) =>
+      byte
+        .toString(16)
+        .padStart(2, '0')
+  ).join('');
+}
+
+function createDeviceId(): string {
+  return `dev_${randomHex(16)}`;
+}
+
+function createDeviceSecret(): string {
+  return randomHex(32);
+}
+
+function currentTimezone(): string {
+  try {
+    return (
+      Intl.DateTimeFormat()
+        .resolvedOptions()
+        .timeZone ||
+      'UTC'
+    );
+  } catch {
+    return 'UTC';
+  }
+}
+
+/* =========================================================
+   REPARAR DEVICE STATE
+========================================================= */
+
+async function getOrRepairDeviceState():
+  Promise<DeviceState> {
+  const timezone =
+    currentTimezone();
+
+  const existing =
+    await db.device.get(
+      'device'
+    );
+
+  const raw =
+    existing as
+      | Partial<DeviceState>
+      | undefined;
+
+  const validDeviceId =
+    typeof raw?.deviceId ===
+      'string' &&
+    raw.deviceId.trim().length >=
+      20;
+
+  const validDeviceSecret =
+    typeof raw?.deviceSecret ===
+      'string' &&
+    raw.deviceSecret.trim().length >=
+      32;
+
+  /*
+   * Se não houver identidade ou ela for de uma
+   * versão antiga/incompleta, criamos uma nova.
+   *
+   * Isso NÃO apaga medicamentos nem histórico.
+   */
+  if (
+    !existing ||
+    !validDeviceId ||
+    !validDeviceSecret
+  ) {
+    const repaired:
+      DeviceState = {
+        id: 'device',
+
+        deviceId:
+          createDeviceId(),
+
+        deviceSecret:
+          createDeviceSecret(),
+
+        timezone,
+
+        pushSubscribed:
+          false,
+      };
+
+    await db.device.put(
+      repaired
+    );
+
+    console.info(
+      '[Device] Identidade local criada/reparada.'
+    );
+
+    return repaired;
+  }
+
+  if (
+    existing.timezone !==
+    timezone
+  ) {
+    await db.device.update(
+      'device',
+      {
+        timezone,
+      }
+    );
+
+    return {
+      ...existing,
+      timezone,
+    };
+  }
+
+  return existing;
+}
+
+/* =========================================================
+   BASE64
+========================================================= */
+
 function base64ToUint8Array(
-  base64String: string
+  value: string
 ): Uint8Array {
   const normalized =
-    base64String.trim();
+    value.trim();
 
   if (!normalized) {
     throw new Error(
@@ -98,7 +242,10 @@ function base64ToUint8Array(
     '='.repeat(
       (
         4 -
-        (normalized.length % 4)
+        (
+          normalized.length %
+          4
+        )
       ) % 4
     );
 
@@ -111,14 +258,15 @@ function base64ToUint8Array(
       .replace(/_/g, '/');
 
   try {
-    const rawData =
-      window.atob(base64);
+    const raw =
+      window.atob(
+        base64
+      );
 
     return Uint8Array.from(
-      Array.from(rawData).map(
-        (character) =>
-          character.charCodeAt(0)
-      )
+      raw,
+      (character) =>
+        character.charCodeAt(0)
     );
   } catch {
     throw new Error(
@@ -127,132 +275,264 @@ function base64ToUint8Array(
   }
 }
 
-/**
- * Extrai do backend:
- *
- * error
- * stage
- * code
- * detail
- *
- * Assim não ficamos apenas com:
- * "Falha ao registrar push".
- */
+function arrayBufferToBase64Url(
+  buffer: ArrayBuffer
+): string {
+  const bytes =
+    new Uint8Array(
+      buffer
+    );
+
+  let binary = '';
+
+  for (
+    const byte of bytes
+  ) {
+    binary +=
+      String.fromCharCode(
+        byte
+      );
+  }
+
+  return window
+    .btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+/* =========================================================
+   SERIALIZAR SUBSCRIPTION
+========================================================= */
+
+function serializePushSubscription(
+  subscription: PushSubscription
+): SerializedPushSubscription {
+  const endpoint =
+    subscription.endpoint
+      ?.trim();
+
+  if (!endpoint) {
+    throw new Error(
+      'A inscrição Push não forneceu um endpoint.'
+    );
+  }
+
+  /*
+   * Preferimos getKey(), pois isso evita diferenças
+   * de implementação de subscription.toJSON() no iOS.
+   */
+  const p256dhBuffer =
+    subscription.getKey(
+      'p256dh'
+    );
+
+  const authBuffer =
+    subscription.getKey(
+      'auth'
+    );
+
+  const json =
+    subscription.toJSON();
+
+  const fallbackP256dh =
+    json.keys?.p256dh;
+
+  const fallbackAuth =
+    json.keys?.auth;
+
+  const p256dh =
+    p256dhBuffer
+      ? arrayBufferToBase64Url(
+          p256dhBuffer
+        )
+      : fallbackP256dh;
+
+  const auth =
+    authBuffer
+      ? arrayBufferToBase64Url(
+          authBuffer
+        )
+      : fallbackAuth;
+
+  if (
+    typeof p256dh !==
+      'string' ||
+    !p256dh.trim()
+  ) {
+    throw new Error(
+      'A inscrição Push não forneceu a chave p256dh.'
+    );
+  }
+
+  if (
+    typeof auth !==
+      'string' ||
+    !auth.trim()
+  ) {
+    throw new Error(
+      'A inscrição Push não forneceu a chave auth.'
+    );
+  }
+
+  return {
+    endpoint,
+
+    expirationTime:
+      subscription
+        .expirationTime ??
+      null,
+
+    keys: {
+      p256dh:
+        p256dh.trim(),
+
+      auth:
+        auth.trim(),
+    },
+  };
+}
+
+/* =========================================================
+   API ERROR
+========================================================= */
+
 async function parseApiError(
   response: Response,
   fallback: string
 ): Promise<string> {
-  let raw = '';
+  let text = '';
 
   try {
-    raw =
+    text =
       await response.text();
   } catch {
     return `${fallback} (${response.status})`;
   }
 
-  if (!raw) {
+  if (!text) {
     return `${fallback} (${response.status})`;
   }
 
   try {
-    const json =
-      JSON.parse(raw) as {
+    const data =
+      JSON.parse(text) as {
         error?: unknown;
         stage?: unknown;
         code?: unknown;
         detail?: unknown;
+        fields?: unknown;
       };
 
-    const error =
-      typeof json.error === 'string'
-        ? json.error
-        : fallback;
+    const parts:
+      string[] = [];
 
-    const stage =
-      typeof json.stage === 'string'
-        ? json.stage
-        : '';
+    parts.push(
+      typeof data.error ===
+        'string'
+        ? data.error
+        : fallback
+    );
 
-    const code =
-      typeof json.code === 'string'
-        ? json.code
-        : '';
-
-    const detail =
-      typeof json.detail === 'string'
-        ? json.detail
-        : '';
-
-    let message =
-      error;
-
-    if (stage) {
-      message +=
-        ` [${stage}]`;
+    if (
+      typeof data.stage ===
+        'string'
+    ) {
+      parts.push(
+        `[${data.stage}]`
+      );
     }
 
-    if (code) {
-      message +=
-        ` [${code}]`;
+    if (
+      typeof data.code ===
+        'string'
+    ) {
+      parts.push(
+        `[${data.code}]`
+      );
     }
 
-    if (detail) {
-      message +=
-        ` — ${detail}`;
+    if (
+      typeof data.detail ===
+        'string' &&
+      data.detail
+    ) {
+      parts.push(
+        `— ${data.detail}`
+      );
     }
 
-    return message;
+    if (
+      Array.isArray(
+        data.fields
+      ) &&
+      data.fields.length
+    ) {
+      parts.push(
+        `Campos: ${data.fields.join(
+          ', '
+        )}`
+      );
+    }
+
+    return parts.join(
+      ' '
+    );
   } catch {
     return (
-      `${fallback} (${response.status}) — ${raw}`
+      `${fallback} (${response.status}) — ${text}`
     );
   }
 }
 
 /* =========================================================
-   REGISTRAR SERVICE WORKER
+   SERVICE WORKER
 ========================================================= */
 
 export async function registerServiceWorker():
   Promise<ServiceWorkerRegistration | null> {
   if (
-    typeof window === 'undefined' ||
+    typeof window ===
+      'undefined' ||
     !(
-      'serviceWorker' in navigator
+      'serviceWorker' in
+      navigator
     )
   ) {
     return null;
   }
 
   try {
-    /**
-     * Registrar pode retornar enquanto o worker ainda
-     * está instalando.
-     */
-    await navigator.serviceWorker.register(
-      '/sw.js',
-      {
-        scope: '/',
-        updateViaCache:
-          'none',
-      }
-    );
+    await navigator
+      .serviceWorker
+      .register(
+        '/sw.js',
+        {
+          scope: '/',
+          updateViaCache:
+            'none',
+        }
+      );
 
-    /**
-     * Aqui podemos esperar, porque esta função deve
-     * rodar antes do usuário tocar no botão.
-     */
     const registration =
-      await navigator.serviceWorker.ready;
+      await navigator
+        .serviceWorker
+        .ready;
 
     cachedServiceWorkerRegistration =
       registration;
 
-    /**
-     * Atualização não precisa bloquear.
-     */
-    registration
+    try {
+      cachedPushSubscription =
+        await registration
+          .pushManager
+          .getSubscription();
+    } catch {
+      cachedPushSubscription =
+        null;
+    }
+
+    void registration
       .update()
       .catch(
         () => undefined
@@ -269,24 +549,18 @@ export async function registerServiceWorker():
       null;
 
     console.error(
-      '[ServiceWorker] Falha:',
+      '[ServiceWorker]',
       error
     );
 
     throw new Error(
-      `Falha ao inicializar o sistema de notificações: ${unknownErrorMessage(
+      `Falha ao inicializar o Service Worker: ${unknownErrorMessage(
         error
       )}`
     );
   }
 }
 
-/**
- * Usar somente em operações em que podemos aguardar.
- *
- * NÃO devemos chamar isso antes de subscribe()
- * no segundo toque do iPhone.
- */
 async function getServiceWorkerRegistration():
   Promise<ServiceWorkerRegistration> {
   if (
@@ -299,7 +573,8 @@ async function getServiceWorkerRegistration():
     typeof navigator ===
       'undefined' ||
     !(
-      'serviceWorker' in navigator
+      'serviceWorker' in
+      navigator
     )
   ) {
     throw new Error(
@@ -308,7 +583,8 @@ async function getServiceWorkerRegistration():
   }
 
   const existing =
-    await navigator.serviceWorker
+    await navigator
+      .serviceWorker
       .getRegistration('/');
 
   if (existing) {
@@ -318,34 +594,26 @@ async function getServiceWorkerRegistration():
     return existing;
   }
 
-  const ready =
-    await navigator.serviceWorker.ready;
+  const registration =
+    await navigator
+      .serviceWorker
+      .ready;
 
   cachedServiceWorkerRegistration =
-    ready;
+    registration;
 
-  return ready;
+  return registration;
 }
 
 /* =========================================================
-   PERMISSÃO DE NOTIFICAÇÃO
+   PERMISSÃO
 ========================================================= */
 
-/**
- * Pede SOMENTE a permissão do sistema.
- *
- * No iPhone:
- *
- * primeiro toque:
- * requestPermission()
- *
- * segundo toque:
- * pushManager.subscribe()
- */
 export async function requestNotificationPermission():
   Promise<NotificationPermission> {
   if (
-    typeof window === 'undefined'
+    typeof window ===
+      'undefined'
   ) {
     throw new Error(
       'As notificações só podem ser ativadas no navegador.'
@@ -354,11 +622,12 @@ export async function requestNotificationPermission():
 
   if (
     !(
-      'Notification' in window
+      'Notification' in
+      window
     )
   ) {
     throw new Error(
-      'A API de notificações não é suportada neste dispositivo.'
+      'Este dispositivo não suporta notificações.'
     );
   }
 
@@ -367,7 +636,7 @@ export async function requestNotificationPermission():
     !isStandalone()
   ) {
     throw new Error(
-      'No iPhone/iPad, abra o aplicativo pelo ícone da Tela de Início. Não tente ativar o Push dentro de uma aba normal do Safari.'
+      'No iPhone/iPad, instale o site na Tela de Início e abra pelo ícone do aplicativo.'
     );
   }
 
@@ -383,40 +652,23 @@ export async function requestNotificationPermission():
       'denied'
   ) {
     throw new Error(
-      'As notificações estão bloqueadas. Abra Ajustes → Notificações → Medicamentos e ative "Permitir Notificações". Se o aplicativo não aparecer ali, remova o PWA da Tela de Início e instale novamente pelo Safari.'
+      'As notificações estão bloqueadas. Abra Ajustes → Notificações → Medicamentos e ative Permitir Notificações.'
     );
   }
 
-  let permission:
-    NotificationPermission;
-
-  try {
-    permission =
-      await Notification
-        .requestPermission();
-  } catch (error) {
-    throw new Error(
-      `Não foi possível abrir a solicitação de permissão: ${unknownErrorMessage(
-        error
-      )}`
-    );
-  }
-
-  if (
-    permission ===
-      'denied'
-  ) {
-    throw new Error(
-      'Você negou a permissão de notificações. Para liberar novamente, use Ajustes → Notificações no iPhone.'
-    );
-  }
+  const permission =
+    await Notification
+      .requestPermission();
 
   if (
     permission !==
       'granted'
   ) {
     throw new Error(
-      'A permissão de notificações ainda não foi concedida.'
+      permission ===
+        'denied'
+        ? 'A permissão de notificações foi negada.'
+        : 'A permissão de notificações ainda não foi concedida.'
     );
   }
 
@@ -424,13 +676,14 @@ export async function requestNotificationPermission():
 }
 
 /* =========================================================
-   ATIVAR WEB PUSH
+   SUBSCRIBE
 ========================================================= */
 
 export async function subscribeToPush():
   Promise<PushSubscription> {
   if (
-    typeof window === 'undefined'
+    typeof window ===
+      'undefined'
   ) {
     throw new Error(
       'Web Push só pode ser ativado no navegador.'
@@ -439,17 +692,19 @@ export async function subscribeToPush():
 
   if (
     !(
-      'serviceWorker' in navigator
+      'serviceWorker' in
+      navigator
     )
   ) {
     throw new Error(
-      'Service Worker não é suportado neste dispositivo.'
+      'Service Worker não é suportado.'
     );
   }
 
   if (
     !(
-      'PushManager' in window
+      'PushManager' in
+      window
     )
   ) {
     throw new Error(
@@ -459,11 +714,12 @@ export async function subscribeToPush():
 
   if (
     !(
-      'Notification' in window
+      'Notification' in
+      window
     )
   ) {
     throw new Error(
-      'A API de notificações não é suportada neste dispositivo.'
+      'Notificações não são suportadas.'
     );
   }
 
@@ -475,34 +731,22 @@ export async function subscribeToPush():
     !isStandalone()
   ) {
     throw new Error(
-      'No iPhone/iPad, primeiro adicione o site à Tela de Início e depois abra pelo ícone do aplicativo.'
+      'No iPhone/iPad, abra o PWA pelo ícone da Tela de Início.'
     );
   }
-
-  /* =======================================================
-     ETAPA 1 — PERMISSÃO
-  ======================================================= */
 
   if (
     Notification.permission ===
       'denied'
   ) {
     throw new Error(
-      'Sem permissão para notificações. Abra Ajustes → Notificações → Medicamentos → Permitir Notificações.'
+      'Sem permissão para notificações. Abra Ajustes → Notificações → Medicamentos.'
     );
   }
 
-  /**
-   * No iPhone fazemos propositalmente em duas etapas.
-   *
-   * PRIMEIRO TOQUE:
-   * exibe o alerta de permissão.
-   *
-   * Depois que o usuário permite, pedimos para tocar
-   * novamente.
-   *
-   * Isso evita consumir o gesto do usuário antes do
-   * pushManager.subscribe().
+  /*
+   * Compatibilidade com a tela antiga:
+   * se ainda estiver "default", pedimos a permissão.
    */
   if (
     Notification.permission ===
@@ -513,13 +757,12 @@ export async function subscribeToPush():
 
     if (
       permission ===
-        'granted'
+        'granted' &&
+      ios
     ) {
-      if (ios) {
-        throw new Error(
-          'Permissão concedida com sucesso. Agora toque novamente em "Solicitar / ativar permissão" para concluir a ativação do Push.'
-        );
-      }
+      throw new Error(
+        'Permissão concedida. Agora toque novamente em "Ativar Push".'
+      );
     }
   }
 
@@ -528,45 +771,29 @@ export async function subscribeToPush():
       'granted'
   ) {
     throw new Error(
-      'A permissão para notificações ainda não está ativa.'
+      'Primeiro conceda permissão para notificações.'
     );
   }
 
-  /* =======================================================
-     ETAPA 2 — VAPID
-  ======================================================= */
-
-  const publicKey =
+  const vapidPublicKey =
     process.env
       .NEXT_PUBLIC_VAPID_PUBLIC_KEY
       ?.trim();
 
-  if (!publicKey) {
+  if (!vapidPublicKey) {
     throw new Error(
-      'NEXT_PUBLIC_VAPID_PUBLIC_KEY não está configurada no deployment da Vercel.'
+      'NEXT_PUBLIC_VAPID_PUBLIC_KEY não está configurada na Vercel.'
     );
   }
 
-  let applicationServerKey:
-    Uint8Array;
-
-  try {
-    applicationServerKey =
-      base64ToUint8Array(
-        publicKey
-      );
-  } catch (error) {
-    throw new Error(
-      unknownErrorMessage(
-        error,
-        'Chave VAPID pública inválida.'
-      )
+  /*
+   * Tudo isto é síncrono, portanto não perde
+   * o gesto do usuário.
+   */
+  const applicationServerKey =
+    base64ToUint8Array(
+      vapidPublicKey
     );
-  }
-
-  /* =======================================================
-     ETAPA 3 — SERVICE WORKER
-  ======================================================= */
 
   let registration:
     ServiceWorkerRegistration;
@@ -577,15 +804,13 @@ export async function subscribeToPush():
     registration =
       cachedServiceWorkerRegistration;
   } else {
-    /**
-     * No iOS NÃO queremos fazer await de
-     * navigator.serviceWorker.ready aqui.
-     *
-     * A inicialização deve acontecer antes do toque.
+    /*
+     * No iOS não fazemos await de ready neste ponto,
+     * pois subscribe() deve continuar ligado ao clique.
      */
     if (ios) {
       throw new Error(
-        'O sistema de notificações ainda está inicializando. Feche o aplicativo, abra novamente pelo ícone da Tela de Início, aguarde alguns segundos e toque novamente.'
+        'O Service Worker ainda está inicializando. Feche e abra o aplicativo novamente e tente outra vez.'
       );
     }
 
@@ -593,117 +818,132 @@ export async function subscribeToPush():
       await getServiceWorkerRegistration();
   }
 
-  /* =======================================================
-     ETAPA 4 — PUSH SUBSCRIPTION
-  ======================================================= */
+  let subscription =
+    cachedPushSubscription;
 
-  let subscription:
-    PushSubscription;
+  if (!subscription) {
+    try {
+      subscription =
+        await registration
+          .pushManager
+          .subscribe({
+            userVisibleOnly:
+              true,
 
-  try {
-    /**
-     * No iPhone, quando chegamos aqui:
-     *
-     * - permission já é granted
-     * - registration já está em memória
-     * - VAPID já foi preparada
-     *
-     * Portanto este é o PRIMEIRO await relevante
-     * do segundo toque.
-     */
-    subscription =
-      await registration
-        .pushManager
-        .subscribe({
-          userVisibleOnly:
-            true,
+            applicationServerKey:
+              applicationServerKey as BufferSource,
+          });
 
-          applicationServerKey:
-            applicationServerKey as BufferSource,
-        });
-  } catch (error) {
-    console.error(
-      '[Push] pushManager.subscribe() falhou:',
-      error
-    );
-
-    if (
-      error instanceof
-        DOMException
-    ) {
-      if (
-        error.name ===
-          'NotAllowedError'
-      ) {
-        throw new Error(
-          'O iPhone não autorizou a criação do Push. Confirme que "Permitir Notificações" está ativo em Ajustes → Notificações e que você abriu o aplicativo pelo ícone da Tela de Início.'
-        );
-      }
+      cachedPushSubscription =
+        subscription;
+    } catch (error) {
+      console.error(
+        '[Push] subscribe():',
+        error
+      );
 
       if (
-        error.name ===
-          'InvalidStateError'
+        error instanceof
+          DOMException
       ) {
-        throw new Error(
-          'Existe uma inscrição Push incompatível com a chave VAPID atual. Remova o aplicativo da Tela de Início, instale-o novamente pelo Safari e tente de novo.'
-        );
-      }
+        if (
+          error.name ===
+            'NotAllowedError'
+        ) {
+          throw new Error(
+            'O iPhone não autorizou o Web Push. Confirme a permissão em Ajustes → Notificações.'
+          );
+        }
 
-      if (
-        error.name ===
-          'AbortError'
-      ) {
+        if (
+          error.name ===
+            'InvalidStateError'
+        ) {
+          /*
+           * Pode existir uma subscription antiga criada
+           * com outra chave VAPID.
+           */
+          try {
+            const oldSubscription =
+              await registration
+                .pushManager
+                .getSubscription();
+
+            if (
+              oldSubscription
+            ) {
+              await oldSubscription
+                .unsubscribe();
+            }
+
+            cachedPushSubscription =
+              null;
+          } catch {
+            // ignore
+          }
+
+          throw new Error(
+            'Foi encontrada uma inscrição Push antiga/incompatível e ela foi removida. Toque novamente em "Ativar Push".'
+          );
+        }
+
+        if (
+          error.name ===
+            'AbortError'
+        ) {
+          throw new Error(
+            'O iPhone interrompeu a criação do Push. Feche o aplicativo, abra novamente e tente outra vez.'
+          );
+        }
+
         throw new Error(
-          'O iPhone interrompeu a criação da inscrição Push. Feche o aplicativo completamente, abra novamente e tente outra vez.'
+          `Falha do Web Push (${error.name}): ${error.message}`
         );
       }
 
       throw new Error(
-        `Falha do Push (${error.name}): ${error.message}`
+        `Não foi possível criar a inscrição Push: ${unknownErrorMessage(
+          error
+        )}`
       );
     }
-
-    throw new Error(
-      `Não foi possível criar a inscrição Web Push: ${unknownErrorMessage(
-        error
-      )}`
-    );
   }
 
-  /* =======================================================
-     ETAPA 5 — DISPOSITIVO LOCAL
-  ======================================================= */
+  /*
+   * A partir daqui a PushSubscription já existe.
+   * Agora podemos fazer operações assíncronas normais.
+   */
+  const serialized =
+    serializePushSubscription(
+      subscription
+    );
 
   const device =
-    await db.device.get(
-      'device'
-    );
+    await getOrRepairDeviceState();
 
-  if (!device) {
-    /**
-     * Neste caso a inscrição foi criada no navegador,
-     * mas não temos identidade local para registrá-la.
-     */
-    await subscription
-      .unsubscribe()
-      .catch(
-        () => undefined
-      );
+  const timezone =
+    currentTimezone();
 
+  /*
+   * Validação local antes do fetch.
+   */
+  if (
+    device.deviceId.length <
+      20
+  ) {
     throw new Error(
-      'O dispositivo ainda não foi inicializado no aplicativo. Feche o app, abra novamente e tente de novo.'
+      'deviceId local inválido.'
     );
   }
 
-  const timezone =
-    Intl.DateTimeFormat()
-      .resolvedOptions()
-      .timeZone ||
-    'UTC';
-
-  /* =======================================================
-     ETAPA 6 — REGISTRAR NO BACKEND
-  ======================================================= */
+  if (
+    device.deviceSecret.length <
+      32
+  ) {
+    throw new Error(
+      'deviceSecret local inválido.'
+    );
+  }
 
   let response:
     Response;
@@ -717,6 +957,9 @@ export async function subscribeToPush():
 
           headers: {
             'content-type':
+              'application/json',
+
+            accept:
               'application/json',
           },
 
@@ -733,56 +976,34 @@ export async function subscribeToPush():
               timezone,
 
               subscription:
-                subscription
-                  .toJSON(),
+                serialized,
             }),
         }
       );
   } catch (error) {
-    console.error(
-      '[Push] Falha de rede ao registrar:',
-      error
-    );
-
     throw new Error(
       `A inscrição foi criada no iPhone, mas não foi possível acessar o servidor: ${unknownErrorMessage(
         error
-      )}. Toque novamente para tentar registrar no backend.`
+      )}`
     );
   }
 
   if (!response.ok) {
-    const message =
+    throw new Error(
       await parseApiError(
         response,
-        `Falha ao registrar Push no servidor`
-      );
-
-    console.error(
-      '[Push] Backend recusou inscrição:',
-      message
-    );
-
-    /**
-     * NÃO removemos a PushSubscription daqui.
-     *
-     * Assim, se o problema for Supabase/Vercel,
-     * o próximo toque pode tentar novamente.
-     */
-    throw new Error(
-      message
+        'Falha ao registrar Push no servidor'
+      )
     );
   }
-
-  /* =======================================================
-     ETAPA 7 — MARCAR LOCALMENTE
-  ======================================================= */
 
   await db.device.update(
     'device',
     {
       pushSubscribed:
         true,
+
+      timezone,
     }
   );
 
@@ -794,45 +1015,32 @@ export async function subscribeToPush():
     }
   );
 
-  /* =======================================================
-     ETAPA 8 — SINCRONIZAR REMINDERS
-  ======================================================= */
-
   try {
     await syncReminderJobs();
   } catch (error) {
-    /**
-     * Importante:
-     *
-     * Push já foi registrado.
-     * Portanto não dizemos que "falhou o Push"
-     * apenas porque a sincronização dos jobs falhou.
+    /*
+     * Não desfazemos o Push se somente a sincronização
+     * dos lembretes falhar.
      */
     console.error(
-      '[Push] Push ativado, mas sync dos lembretes falhou:',
+      '[Push] Registrado, mas syncReminderJobs falhou:',
       error
     );
   }
 
   console.info(
-    '[Push] Web Push ativado com sucesso.'
+    '[Push] Ativado com sucesso.'
   );
 
   return subscription;
 }
 
 /* =========================================================
-   DESATIVAR WEB PUSH
+   UNSUBSCRIBE
 ========================================================= */
 
 export async function unsubscribeFromPush():
   Promise<void> {
-  if (
-    typeof window === 'undefined'
-  ) {
-    return;
-  }
-
   const device =
     await db.device.get(
       'device'
@@ -843,7 +1051,10 @@ export async function unsubscribeFromPush():
       null;
 
   if (
-    'serviceWorker' in navigator
+    typeof navigator !==
+      'undefined' &&
+    'serviceWorker' in
+      navigator
   ) {
     try {
       registration =
@@ -853,44 +1064,24 @@ export async function unsubscribeFromPush():
     }
   }
 
-  if (registration) {
-    try {
-      const subscription =
-        await registration
-          .pushManager
-          .getSubscription();
-
-      if (subscription) {
-        await subscription
-          .unsubscribe();
-      }
-    } catch (error) {
-      console.warn(
-        '[Push] Falha ao remover subscription local:',
-        error
-      );
-    }
-  }
-
+  /*
+   * Primeiro avisamos o backend para que ele pare
+   * de enviar notificações.
+   */
   if (device) {
-    let response:
-      Response;
-
     try {
-      response =
+      const response =
         await fetch(
           '/api/push/unsubscribe',
           {
-            method:
-              'POST',
+            method: 'POST',
 
             headers: {
               'content-type':
                 'application/json',
             },
 
-            cache:
-              'no-store',
+            cache: 'no-store',
 
             body:
               JSON.stringify({
@@ -902,23 +1093,45 @@ export async function unsubscribeFromPush():
               }),
           }
         );
+
+      if (!response.ok) {
+        console.warn(
+          '[Push] Backend unsubscribe:',
+          await parseApiError(
+            response,
+            'Falha ao desativar Push no servidor'
+          )
+        );
+      }
     } catch (error) {
-      throw new Error(
-        `Não foi possível acessar o servidor para desativar o Push: ${unknownErrorMessage(
-          error
-        )}`
+      console.warn(
+        '[Push] Falha ao avisar backend:',
+        error
       );
     }
+  }
 
-    if (!response.ok) {
-      throw new Error(
-        await parseApiError(
-          response,
-          'Falha ao desativar Push no servidor'
-        )
+  try {
+    const subscription =
+      cachedPushSubscription ??
+      (
+        registration
+          ? await registration
+              .pushManager
+              .getSubscription()
+          : null
       );
-    }
 
+    if (subscription) {
+      await subscription
+        .unsubscribe();
+    }
+  } finally {
+    cachedPushSubscription =
+      null;
+  }
+
+  if (device) {
     await db.device.update(
       'device',
       {
@@ -938,15 +1151,12 @@ export async function unsubscribeFromPush():
 }
 
 /* =========================================================
-   SINCRONIZAR LEMBRETES
+   SINCRONIZAR JOBS
 ========================================================= */
 
 export async function syncReminderJobs(
   daysAhead = 60
 ) {
-  /**
-   * Evita valores absurdos acidentalmente.
-   */
   const safeDaysAhead =
     Math.max(
       0,
@@ -988,10 +1198,6 @@ export async function syncReminderJobs(
   if (
     !device.pushSubscribed
   ) {
-    console.info(
-      '[Reminders] Push não está inscrito.'
-    );
-
     return {
       skipped: true,
       reason:
@@ -1003,13 +1209,10 @@ export async function syncReminderJobs(
   const jobs:
     ReminderJobPayload[] = [];
 
-  const notificationsEnabled =
+  if (
     settings
       ?.notificationsEnabled !==
-    false;
-
-  if (
-    notificationsEnabled
+    false
   ) {
     for (
       let offset = 0;
@@ -1038,12 +1241,7 @@ export async function syncReminderJobs(
           occurrence.medication;
 
         if (
-          !medication.enabled
-        ) {
-          continue;
-        }
-
-        if (
+          !medication.enabled ||
           !medication
             .reminders
             .enabled
@@ -1119,116 +1317,87 @@ export async function syncReminderJobs(
     }
   }
 
-  const timezone =
-    Intl.DateTimeFormat()
-      .resolvedOptions()
-      .timeZone ||
-    'UTC';
+  const response =
+    await fetch(
+      '/api/reminders/sync',
+      {
+        method: 'POST',
 
-  let response:
-    Response;
+        headers: {
+          'content-type':
+            'application/json',
+        },
 
-  try {
-    response =
-      await fetch(
-        '/api/reminders/sync',
-        {
-          method:
-            'POST',
+        cache: 'no-store',
 
-          headers: {
-            'content-type':
-              'application/json',
-          },
+        body:
+          JSON.stringify({
+            deviceId:
+              device.deviceId,
 
-          cache:
-            'no-store',
+            deviceSecret:
+              device.deviceSecret,
 
-          body:
-            JSON.stringify({
-              deviceId:
-                device.deviceId,
+            timezone:
+              currentTimezone(),
 
-              deviceSecret:
-                device.deviceSecret,
+            quietHours: {
+              enabled:
+                settings
+                  ?.quietHoursEnabled ??
+                false,
 
-              timezone,
+              start:
+                settings
+                  ?.quietStart ??
+                '23:00',
 
-              quietHours: {
-                enabled:
-                  settings
-                    ?.quietHoursEnabled ??
-                  false,
+              end:
+                settings
+                  ?.quietEnd ??
+                '07:00',
+            },
 
-                start:
-                  settings
-                    ?.quietStart ??
-                  '23:00',
-
-                end:
-                  settings
-                    ?.quietEnd ??
-                  '07:00',
-              },
-
-              jobs,
-            }),
-        }
-      );
-  } catch (error) {
-    throw new Error(
-      `Falha de rede ao sincronizar lembretes: ${unknownErrorMessage(
-        error
-      )}`
+            jobs,
+          }),
+      }
     );
-  }
 
   if (!response.ok) {
     throw new Error(
       await parseApiError(
         response,
-        `Falha ao sincronizar lembretes`
+        'Falha ao sincronizar lembretes'
       )
     );
   }
 
-  let serverResult:
+  let result:
     unknown = null;
 
   try {
-    serverResult =
+    result =
       await response.json();
   } catch {
-    // Endpoint pode responder sem JSON.
+    // resposta sem JSON
   }
 
-  console.info(
-    `[Reminders] ${jobs.length} ocorrência(s) sincronizada(s).`,
-    serverResult
-  );
-
   return {
-    skipped:
-      false,
-
+    skipped: false,
     jobs:
       jobs.length,
-
-    result:
-      serverResult,
+    result,
   };
 }
 
 /* =========================================================
-   CANCELAR UMA OCORRÊNCIA
+   CANCELAR OCORRÊNCIA
 ========================================================= */
 
 export async function cancelOccurrenceReminder(
   occurrenceId: string
 ): Promise<void> {
-  if (
-    !occurrenceId
-  ) {
+  if (!occurrenceId) {
     return;
   }
 
@@ -1243,44 +1412,31 @@ export async function cancelOccurrenceReminder(
     return;
   }
 
-  let response:
-    Response;
+  const response =
+    await fetch(
+      '/api/reminders/cancel',
+      {
+        method: 'POST',
 
-  try {
-    response =
-      await fetch(
-        '/api/reminders/cancel',
-        {
-          method:
-            'POST',
+        headers: {
+          'content-type':
+            'application/json',
+        },
 
-          headers: {
-            'content-type':
-              'application/json',
-          },
+        cache: 'no-store',
 
-          cache:
-            'no-store',
+        body:
+          JSON.stringify({
+            deviceId:
+              device.deviceId,
 
-          body:
-            JSON.stringify({
-              deviceId:
-                device.deviceId,
+            deviceSecret:
+              device.deviceSecret,
 
-              deviceSecret:
-                device.deviceSecret,
-
-              occurrenceId,
-            }),
-        }
-      );
-  } catch (error) {
-    throw new Error(
-      `Falha de rede ao cancelar o lembrete: ${unknownErrorMessage(
-        error
-      )}`
+            occurrenceId,
+          }),
+      }
     );
-  }
 
   if (!response.ok) {
     throw new Error(
@@ -1296,33 +1452,14 @@ export async function cancelOccurrenceReminder(
    TESTE LOCAL
 ========================================================= */
 
-/**
- * Este teste NÃO testa:
- *
- * - Supabase
- * - Web Push real
- * - cron-job.org
- * - reminder_jobs
- *
- * Ele testa somente:
- *
- * - permissão
- * - Service Worker
- * - showNotification()
- */
 export async function testLocalNotification():
   Promise<void> {
   if (
-    typeof window === 'undefined'
-  ) {
-    throw new Error(
-      'O teste só pode ser executado no navegador.'
-    );
-  }
-
-  if (
+    typeof window ===
+      'undefined' ||
     !(
-      'Notification' in window
+      'Notification' in
+      window
     )
   ) {
     throw new Error(
@@ -1331,21 +1468,11 @@ export async function testLocalNotification():
   }
 
   if (
-    !(
-      'serviceWorker' in navigator
-    )
-  ) {
-    throw new Error(
-      'Service Worker não é suportado neste dispositivo.'
-    );
-  }
-
-  if (
     isIOSDevice() &&
     !isStandalone()
   ) {
     throw new Error(
-      'No iPhone, abra o aplicativo instalado pela Tela de Início para testar notificações.'
+      'No iPhone, abra o aplicativo pela Tela de Início.'
     );
   }
 
@@ -1373,7 +1500,7 @@ export async function testLocalNotification():
       'Teste do Medicamentos',
       {
         body:
-          'As notificações locais estão funcionando neste dispositivo.',
+          'Permissão e Service Worker estão funcionando.',
 
         icon:
           '/icons/icon-192.png',
@@ -1382,7 +1509,7 @@ export async function testLocalNotification():
           '/icons/badge-96.png',
 
         tag:
-          'medica-local-notification-test',
+          'medica-local-test',
 
         data: {
           url: '/',
@@ -1396,74 +1523,58 @@ export async function testLocalNotification():
 ========================================================= */
 
 export async function getPushStatus() {
+  const standalone =
+    isStandalone();
+
+  const ios =
+    isIOSDevice();
+
   if (
-    typeof window === 'undefined'
+    typeof window ===
+      'undefined' ||
+    !(
+      'serviceWorker' in
+      navigator
+    ) ||
+    !(
+      'PushManager' in
+      window
+    ) ||
+    !(
+      'Notification' in
+      window
+    )
   ) {
     return {
-      supported:
-        false,
-
-      subscribed:
-        false,
-
+      supported: false,
+      subscribed: false,
       permission:
-        'unsupported',
-
+        'unsupported' as const,
       hasBrowserSubscription:
         false,
-
       backendMarkedSubscribed:
         false,
-
-      standalone:
-        false,
+      standalone,
+      ios,
     };
   }
 
-  const supported =
-    'serviceWorker' in navigator &&
-    'PushManager' in window &&
-    'Notification' in window;
-
-  if (!supported) {
-    return {
-      supported:
-        false,
-
-      subscribed:
-        false,
-
-      permission:
-        'unsupported',
-
-      hasBrowserSubscription:
-        false,
-
-      backendMarkedSubscribed:
-        false,
-
-      standalone:
-        isStandalone(),
-    };
-  }
-
-  let browserSubscription:
-    PushSubscription | null =
-      null;
+  let subscription =
+    cachedPushSubscription;
 
   try {
     const registration =
       await getServiceWorkerRegistration();
 
-    browserSubscription =
+    subscription =
       await registration
         .pushManager
         .getSubscription();
-  } catch (error) {
-    console.warn(
-      '[Push Status]',
-      error
-    );
+
+    cachedPushSubscription =
+      subscription;
+  } catch {
+    subscription = null;
   }
 
   const device =
@@ -1472,9 +1583,7 @@ export async function getPushStatus() {
     );
 
   const hasBrowserSubscription =
-    Boolean(
-      browserSubscription
-    );
+    Boolean(subscription);
 
   const backendMarkedSubscribed =
     Boolean(
@@ -1483,8 +1592,7 @@ export async function getPushStatus() {
     );
 
   return {
-    supported:
-      true,
+    supported: true,
 
     subscribed:
       hasBrowserSubscription &&
@@ -1497,11 +1605,9 @@ export async function getPushStatus() {
 
     backendMarkedSubscribed,
 
-    standalone:
-      isStandalone(),
+    standalone,
 
-    ios:
-      isIOSDevice(),
+    ios,
   };
 }
 
@@ -1509,24 +1615,17 @@ export async function getPushStatus() {
    PRÉ-INICIALIZAÇÃO
 ========================================================= */
 
-/**
- * A tela de Configurações importa este módulo.
- *
- * Portanto já começamos a preparar o Service Worker antes
- * de o usuário tocar em "Solicitar / ativar permissão".
- *
- * Isso deixa o registration em memória para o segundo toque
- * no iPhone.
- */
 if (
-  typeof window !== 'undefined' &&
-  'serviceWorker' in navigator
+  typeof window !==
+    'undefined' &&
+  'serviceWorker' in
+    navigator
 ) {
   void registerServiceWorker()
     .catch(
       (error) => {
         console.warn(
-          '[ServiceWorker] Pré-inicialização falhou:',
+          '[ServiceWorker] Pré-inicialização:',
           error
         );
       }
