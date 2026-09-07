@@ -2,39 +2,30 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function response(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body, null, 2), {
-    status,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-    },
-  });
-}
-
-function errorText(error: unknown) {
-  if (error instanceof Error) {
-    return error.message.replace(
-      /postgres(?:ql)?:\/\/[^@\s]+@/gi,
-      'postgresql://***@'
-    );
-  }
-
-  return String(error);
+function reply(body: unknown, status = 200) {
+  return new Response(
+    JSON.stringify(body, null, 2),
+    {
+      status,
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      },
+    }
+  );
 }
 
 export async function GET(request: Request) {
   try {
-    // 1. CRON_SECRET
     const secret =
       process.env.CRON_SECRET?.trim();
 
     if (!secret) {
-      return response(
+      return reply(
         {
           ok: false,
           stage: 'cron-secret',
-          error: 'CRON_SECRET não configurado',
+          error: 'CRON_SECRET ausente',
         },
         503
       );
@@ -44,7 +35,7 @@ export async function GET(request: Request) {
       request.headers.get('authorization') !==
       `Bearer ${secret}`
     ) {
-      return response(
+      return reply(
         {
           ok: false,
           stage: 'authorization',
@@ -54,135 +45,88 @@ export async function GET(request: Request) {
       );
     }
 
-    // 2. DATABASE_URL
     const databaseUrl =
       process.env.DATABASE_URL?.trim();
 
     if (!databaseUrl) {
-      return response(
+      return reply(
         {
           ok: false,
           stage: 'database-url',
-          error: 'DATABASE_URL não configurada',
+          error: 'DATABASE_URL ausente',
         },
         503
       );
     }
 
-    // Mostra informações seguras, sem senha.
-    let databaseInfo;
+    let parsed: URL;
 
     try {
-      const url = new URL(databaseUrl);
-
-      databaseInfo = {
-        username: decodeURIComponent(url.username),
-        host: url.hostname,
-        port: url.port || 'default',
-        database: url.pathname,
-      };
+      parsed =
+        new URL(databaseUrl);
     } catch {
-      return response(
+      return reply(
         {
           ok: false,
           stage: 'database-url-format',
-          error: 'DATABASE_URL possui formato inválido',
+          error: 'DATABASE_URL inválida',
         },
         500
       );
     }
 
-    // 3. PostgreSQL
-    const { Pool } =
-      await import('pg');
+    return reply({
+      ok: true,
+      stage: 'environment-ok',
 
-    const pool =
-      new Pool({
-        connectionString: databaseUrl,
-        ssl: {
-          rejectUnauthorized: false,
-        },
-        max: 1,
-        connectionTimeoutMillis: 10000,
-        idleTimeoutMillis: 5000,
-        allowExitOnIdle: true,
-      });
+      database: {
+        username:
+          decodeURIComponent(
+            parsed.username
+          ),
 
-    try {
-      const connection =
-        await pool.query(`
-          select
-            current_user,
-            current_database() as current_database
-        `);
+        host:
+          parsed.hostname,
 
-      const tables =
-        await pool.query(`
-          select
-            to_regclass('public.push_devices')::text
-              as push_devices,
-            to_regclass('public.reminder_jobs')::text
-              as reminder_jobs
-        `);
+        port:
+          parsed.port || 'default',
 
-      return response({
-        ok: true,
-        stage: 'diagnostic-complete',
+        database:
+          parsed.pathname,
+      },
 
-        databaseUrl: databaseInfo,
+      environment: {
+        databaseUrl: true,
 
-        connectedAs:
-          connection.rows[0]?.current_user,
+        vapidPublic:
+          Boolean(
+            process.env
+              .NEXT_PUBLIC_VAPID_PUBLIC_KEY
+          ),
 
-        connectedDatabase:
-          connection.rows[0]?.current_database,
+        vapidPrivate:
+          Boolean(
+            process.env
+              .VAPID_PRIVATE_KEY
+          ),
 
-        tables:
-          tables.rows[0],
-
-        vapid: {
-          publicKey:
-            Boolean(
-              process.env
-                .NEXT_PUBLIC_VAPID_PUBLIC_KEY
-            ),
-
-          privateKey:
-            Boolean(
-              process.env
-                .VAPID_PRIVATE_KEY
-            ),
-
-          subject:
-            Boolean(
-              process.env
-                .VAPID_SUBJECT
-            ),
-        },
-      });
-    } catch (error) {
-      return response(
-        {
-          ok: false,
-          stage: 'database-connection',
-          error: 'Falha ao conectar ao PostgreSQL',
-          detail: errorText(error),
-          databaseUrl: databaseInfo,
-        },
-        500
-      );
-    } finally {
-      await pool
-        .end()
-        .catch(() => undefined);
-    }
+        vapidSubject:
+          Boolean(
+            process.env
+              .VAPID_SUBJECT
+          ),
+      },
+    });
   } catch (error) {
-    return response(
+    return reply(
       {
         ok: false,
         stage: 'unhandled',
-        error: 'Erro inesperado',
-        detail: errorText(error),
+
+        detail:
+          error instanceof Error
+            ? error.message
+            : String(error),
       },
       500
     );
