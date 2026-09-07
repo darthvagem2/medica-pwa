@@ -623,60 +623,24 @@ export async function GET(
     /* =====================================================
        3. CRIAR CLIENTE SUPABASE
     ===================================================== */
+const supabase = createClient(
+  supabaseUrl,
+  supabaseSecretKey,
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
 
-    let supabase:
-      ReturnType<
-        typeof createClient
-      >;
-
-    try {
-      supabase =
-        createClient(
-          supabaseUrl,
-          supabaseSecretKey,
-          {
-            auth: {
-              persistSession:
-                false,
-
-              autoRefreshToken:
-                false,
-
-              detectSessionInUrl:
-                false,
-            },
-
-            global: {
-              headers: {
-                'X-Client-Info':
-                  'medica-pwa-cron',
-              },
-            },
-          }
-        );
-    } catch (error) {
-      return reply(
-        {
-          ok: false,
-
-          version:
-            CRON_VERSION,
-
-          stage:
-            'supabase-client',
-
-          error:
-            'Falha ao criar cliente Supabase.',
-
-          detail:
-            safeError(
-              error
-            ),
-        },
-        500
-      );
-    }
-
+    global: {
+      headers: {
+        'X-Client-Info': 'medica-pwa-cron',
+      },
+    },
+  }
+);
+   
     /* =====================================================
        4. TESTAR SUPABASE
     ===================================================== */
