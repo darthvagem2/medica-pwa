@@ -7,7 +7,8 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-const VERSION = 'SUPABASE_PUSH_SUBSCRIBE_V1';
+const VERSION =
+  'SUPABASE_PUSH_SUBSCRIBE_V1';
 
 /* =========================================================
    TIPOS
@@ -15,7 +16,11 @@ const VERSION = 'SUPABASE_PUSH_SUBSCRIBE_V1';
 
 type NormalizedSubscription = {
   endpoint: string;
-  expirationTime: number | null;
+
+  expirationTime:
+    | number
+    | null;
+
   keys: {
     p256dh: string;
     auth: string;
@@ -23,36 +28,56 @@ type NormalizedSubscription = {
 };
 
 /* =========================================================
-   VALIDAÇÃO
+   VALIDAÇÃO DO BODY
 ========================================================= */
 
-const requestSchema = z.object({
-  deviceId: z
-    .string()
-    .trim()
-    .min(1, 'deviceId ausente')
-    .max(512),
+const requestSchema =
+  z.object({
+    deviceId:
+      z.string()
+        .trim()
+        .min(
+          1,
+          'deviceId ausente'
+        )
+        .max(
+          512,
+          'deviceId muito grande'
+        ),
 
-  deviceSecret: z
-    .string()
-    .trim()
-    .min(1, 'deviceSecret ausente')
-    .max(2048),
+    deviceSecret:
+      z.string()
+        .trim()
+        .min(
+          1,
+          'deviceSecret ausente'
+        )
+        .max(
+          2048,
+          'deviceSecret muito grande'
+        ),
 
-  timezone: z
-    .string()
-    .trim()
-    .min(1, 'timezone ausente')
-    .max(256),
+    timezone:
+      z.string()
+        .trim()
+        .min(
+          1,
+          'timezone ausente'
+        )
+        .max(
+          256,
+          'timezone muito grande'
+        ),
 
-  subscription: z.unknown(),
-});
+    subscription:
+      z.unknown(),
+  });
 
 /* =========================================================
-   HELPERS
+   RESPONSE
 ========================================================= */
 
-function response(
+function reply(
   body: unknown,
   status = 200
 ) {
@@ -60,138 +85,241 @@ function response(
     body,
     {
       status,
+
       headers: {
-        'Cache-Control': 'no-store',
+        'Cache-Control':
+          'no-store',
       },
     }
   );
 }
 
+/* =========================================================
+   HASH DO DEVICE SECRET
+========================================================= */
+
 function hashSecret(
   secret: string
 ): string {
-  return createHash('sha256')
-    .update(secret, 'utf8')
-    .digest('hex');
+  return createHash(
+    'sha256'
+  )
+    .update(
+      secret,
+      'utf8'
+    )
+    .digest(
+      'hex'
+    );
 }
+
+/* =========================================================
+   MENSAGEM DE ERRO SEGURA
+========================================================= */
+
+function safeError(
+  error: unknown
+): string {
+  let message =
+    error instanceof Error
+      ? error.message
+      : String(
+          error
+        );
+
+  /*
+   * Evita devolver Secret Key
+   * por acidente.
+   */
+  message =
+    message.replace(
+      /sb_secret_[A-Za-z0-9_-]+/gi,
+      'sb_secret_***'
+    );
+
+  message =
+    message.replace(
+      /Bearer\s+\S+/gi,
+      'Bearer ***'
+    );
+
+  return message;
+}
+
+/* =========================================================
+   NORMALIZAR PUSH SUBSCRIPTION
+========================================================= */
 
 function normalizeSubscription(
   value: unknown
 ):
   | {
       ok: true;
-      value: NormalizedSubscription;
+
+      value:
+        NormalizedSubscription;
     }
   | {
       ok: false;
-      fields: string[];
-      detail: string;
+
+      fields:
+        string[];
+
+      detail:
+        string;
     } {
   if (
-    typeof value !== 'object' ||
+    typeof value !==
+      'object' ||
     value === null
   ) {
     return {
       ok: false,
-      fields: ['subscription'],
+
+      fields: [
+        'subscription',
+      ],
+
       detail:
         'subscription precisa ser um objeto.',
     };
   }
 
-  const raw = value as {
-    endpoint?: unknown;
+  const raw =
+    value as {
+      endpoint?:
+        unknown;
 
-    expirationTime?: unknown;
+      expirationTime?:
+        unknown;
 
-    keys?: {
-      p256dh?: unknown;
-      auth?: unknown;
+      keys?: {
+        p256dh?:
+          unknown;
+
+        auth?:
+          unknown;
+      };
+
+      /*
+       * Fallback para formatos antigos.
+       */
+      p256dh?:
+        unknown;
+
+      auth?:
+        unknown;
     };
 
-    p256dh?: unknown;
-    auth?: unknown;
-  };
-
   const endpoint =
-    typeof raw.endpoint === 'string'
-      ? raw.endpoint.trim()
+    typeof raw.endpoint ===
+      'string'
+      ? raw.endpoint
+          .trim()
       : '';
 
   const nestedP256dh =
     raw.keys &&
-    typeof raw.keys === 'object'
-      ? raw.keys.p256dh
+    typeof raw.keys ===
+      'object'
+      ? raw.keys
+          .p256dh
       : undefined;
 
   const nestedAuth =
     raw.keys &&
-    typeof raw.keys === 'object'
-      ? raw.keys.auth
+    typeof raw.keys ===
+      'object'
+      ? raw.keys
+          .auth
       : undefined;
 
   const p256dh =
-    typeof nestedP256dh === 'string'
-      ? nestedP256dh.trim()
-      : typeof raw.p256dh === 'string'
-        ? raw.p256dh.trim()
+    typeof nestedP256dh ===
+      'string'
+      ? nestedP256dh
+          .trim()
+      : typeof raw.p256dh ===
+          'string'
+        ? raw.p256dh
+            .trim()
         : '';
 
   const auth =
-    typeof nestedAuth === 'string'
-      ? nestedAuth.trim()
-      : typeof raw.auth === 'string'
-        ? raw.auth.trim()
+    typeof nestedAuth ===
+      'string'
+      ? nestedAuth
+          .trim()
+      : typeof raw.auth ===
+          'string'
+        ? raw.auth
+            .trim()
         : '';
 
-  const fields: string[] = [];
+  const invalidFields:
+    string[] = [];
 
   if (!endpoint) {
-    fields.push(
+    invalidFields.push(
       'subscription.endpoint'
     );
   }
 
   if (!p256dh) {
-    fields.push(
+    invalidFields.push(
       'subscription.keys.p256dh'
     );
   }
 
   if (!auth) {
-    fields.push(
+    invalidFields.push(
       'subscription.keys.auth'
     );
   }
 
-  if (fields.length > 0) {
+  if (
+    invalidFields.length >
+    0
+  ) {
     return {
       ok: false,
-      fields,
+
+      fields:
+        invalidFields,
+
       detail:
-        `Campos ausentes ou inválidos: ${fields.join(
+        `Campos ausentes ou inválidos: ${invalidFields.join(
           ', '
         )}`,
     };
   }
 
+  /*
+   * Endpoints Web Push reais
+   * precisam usar HTTPS.
+   */
   if (
     !endpoint
       .toLowerCase()
-      .startsWith('https://')
+      .startsWith(
+        'https://'
+      )
   ) {
     return {
       ok: false,
+
       fields: [
         'subscription.endpoint',
       ],
+
       detail:
         'O endpoint Push precisa começar com https://.',
     };
   }
 
   let expirationTime:
-    number | null = null;
+    number | null =
+      null;
 
   if (
     typeof raw.expirationTime ===
@@ -209,6 +337,7 @@ function normalizeSubscription(
 
     value: {
       endpoint,
+
       expirationTime,
 
       keys: {
@@ -231,17 +360,31 @@ export async function POST(
        1. LER JSON
     ===================================================== */
 
-    let rawBody: unknown;
+    let rawBody:
+      unknown;
 
     try {
       rawBody =
-        await request.json();
-    } catch {
-      return response(
+        await request
+          .json();
+    } catch (error) {
+      console.warn(
+        '[PUSH SUBSCRIBE] JSON inválido:',
+        safeError(
+          error
+        )
+      );
+
+      return reply(
         {
           ok: false,
-          version: VERSION,
-          stage: 'json',
+
+          version:
+            VERSION,
+
+          stage:
+            'json',
+
           error:
             'O corpo da requisição não contém JSON válido.',
         },
@@ -250,7 +393,7 @@ export async function POST(
     }
 
     /* =====================================================
-       2. VALIDAR BODY
+       2. VALIDAR CAMPOS
     ===================================================== */
 
     const parsed =
@@ -258,49 +401,82 @@ export async function POST(
         rawBody
       );
 
-    if (!parsed.success) {
+    if (
+      !parsed.success
+    ) {
       const issues =
-        parsed.error.issues.map(
-          issue => ({
-            field:
-              issue.path.join('.') ||
-              'body',
+        parsed.error
+          .issues
+          .map(
+            issue => ({
+              field:
+                issue.path
+                  .join(
+                    '.'
+                  ) ||
+                'body',
 
-            message:
-              issue.message,
-          })
-        );
+              message:
+                issue.message,
+            })
+          );
 
-      return response(
+      return reply(
         {
           ok: false,
-          version: VERSION,
-          stage: 'validation',
+
+          version:
+            VERSION,
+
+          stage:
+            'validation',
+
           error:
             'Dados de inscrição inválidos.',
+
           issues,
+
+          fields:
+            Array.from(
+              new Set(
+                issues.map(
+                  issue =>
+                    issue.field
+                )
+              )
+            ),
         },
         400
       );
     }
 
-    const body =
+    const {
+      deviceId,
+      deviceSecret,
+      timezone,
+      subscription:
+        rawSubscription,
+    } =
       parsed.data;
 
     /* =====================================================
-       3. NORMALIZAR SUBSCRIPTION
+       3. VALIDAR SUBSCRIPTION
     ===================================================== */
 
     const normalized =
       normalizeSubscription(
-        body.subscription
+        rawSubscription
       );
 
-    if (!normalized.ok) {
-      return response(
+    if (
+      !normalized.ok
+    ) {
+      return reply(
         {
           ok: false,
-          version: VERSION,
+
+          version:
+            VERSION,
 
           stage:
             'subscription-validation',
@@ -318,8 +494,11 @@ export async function POST(
       );
     }
 
+    const subscription =
+      normalized.value;
+
     /* =====================================================
-       4. VARIÁVEIS SUPABASE
+       4. CONFIGURAÇÃO SUPABASE
     ===================================================== */
 
     const supabaseUrl =
@@ -327,78 +506,175 @@ export async function POST(
         .SUPABASE_URL
         ?.trim();
 
-    const supabaseSecret =
+    const supabaseSecretKey =
       process.env
         .SUPABASE_SECRET_KEY
         ?.trim();
 
     if (
-      !supabaseUrl ||
-      !supabaseSecret
+      !supabaseUrl
     ) {
-      return response(
+      return reply(
         {
           ok: false,
-          version: VERSION,
+
+          version:
+            VERSION,
 
           stage:
             'supabase-configuration',
 
           error:
-            'SUPABASE_URL ou SUPABASE_SECRET_KEY não configurada.',
+            'SUPABASE_URL não configurada na Vercel.',
+        },
+        503
+      );
+    }
+
+    if (
+      !supabaseSecretKey
+    ) {
+      return reply(
+        {
+          ok: false,
+
+          version:
+            VERSION,
+
+          stage:
+            'supabase-configuration',
+
+          error:
+            'SUPABASE_SECRET_KEY não configurada na Vercel.',
         },
         503
       );
     }
 
     /* =====================================================
-       5. CLIENTE SUPABASE
+       5. CRIAR CLIENTE SUPABASE
+
+       Usamos <any> por enquanto porque o projeto
+       ainda não possui database.types.ts gerado.
     ===================================================== */
 
     const supabase =
       createClient<any>(
         supabaseUrl,
-        supabaseSecret,
+        supabaseSecretKey,
         {
           auth: {
-            persistSession: false,
+            persistSession:
+              false,
+
             autoRefreshToken:
               false,
+
             detectSessionInUrl:
               false,
+          },
+
+          global: {
+            headers: {
+              'X-Client-Info':
+                'medica-pwa-push-subscribe',
+            },
           },
         }
       );
 
     /* =====================================================
-       6. SALVAR PUSH DEVICE
+       6. TESTAR ACESSO À TABELA
+    ===================================================== */
+
+    const {
+      error:
+        tableError,
+    } =
+      await supabase
+        .from(
+          'push_devices'
+        )
+        .select(
+          'device_id',
+          {
+            head:
+              true,
+
+            count:
+              'exact',
+          }
+        );
+
+    if (
+      tableError
+    ) {
+      console.error(
+        '[PUSH SUBSCRIBE] Falha ao acessar push_devices:',
+        tableError
+      );
+
+      return reply(
+        {
+          ok: false,
+
+          version:
+            VERSION,
+
+          stage:
+            'supabase-connection',
+
+          error:
+            'Não foi possível acessar a tabela push_devices.',
+
+          code:
+            tableError.code,
+
+          detail:
+            tableError.message,
+
+          hint:
+            tableError.hint,
+        },
+        500
+      );
+    }
+
+    /* =====================================================
+       7. SALVAR / ATUALIZAR DEVICE
     ===================================================== */
 
     const now =
       new Date()
         .toISOString();
 
+    const secretHash =
+      hashSecret(
+        deviceSecret
+      );
+
     const {
-      data,
-      error,
+      data:
+        savedDevice,
+
+      error:
+        saveError,
     } =
       await supabase
-        .from('push_devices')
+        .from(
+          'push_devices'
+        )
         .upsert(
           {
             device_id:
-              body.deviceId,
+              deviceId,
 
             secret_hash:
-              hashSecret(
-                body.deviceSecret
-              ),
+              secretHash,
 
-            timezone:
-              body.timezone,
+            timezone,
 
-            subscription:
-              normalized.value,
+            subscription,
 
             active:
               true,
@@ -412,33 +688,40 @@ export async function POST(
           }
         )
         .select(
-          'device_id'
+          'device_id, active, timezone'
         )
         .single();
 
     /* =====================================================
-       7. ERRO SUPABASE
+       8. ERRO AO SALVAR
     ===================================================== */
 
-    if (error) {
+    if (
+      saveError
+    ) {
       console.error(
-        '[PUSH SUBSCRIBE][SUPABASE]',
+        '[PUSH SUBSCRIBE] Falha ao registrar device:',
         {
           code:
-            error.code,
+            saveError.code,
 
           message:
-            error.message,
+            saveError.message,
+
+          detail:
+            saveError.details,
 
           hint:
-            error.hint,
+            saveError.hint,
         }
       );
 
-      return response(
+      return reply(
         {
           ok: false,
-          version: VERSION,
+
+          version:
+            VERSION,
 
           stage:
             'supabase-write',
@@ -447,45 +730,144 @@ export async function POST(
             'Falha ao registrar Push no Supabase.',
 
           code:
-            error.code,
+            saveError.code,
 
           detail:
-            error.message,
+            saveError.message,
 
           hint:
-            error.hint,
+            saveError.hint,
         },
         500
       );
     }
 
     /* =====================================================
-       8. SUCESSO
+       9. CONFIRMAR QUE REALMENTE EXISTE NO BACKEND
     ===================================================== */
 
-    return response({
-      ok: true,
+    const {
+      data:
+        verification,
 
-      version:
-        VERSION,
+      error:
+        verificationError,
+    } =
+      await supabase
+        .from(
+          'push_devices'
+        )
+        .select(
+          'device_id, active'
+        )
+        .eq(
+          'device_id',
+          deviceId
+        )
+        .maybeSingle();
 
-      stage:
-        'registered',
+    if (
+      verificationError
+    ) {
+      console.error(
+        '[PUSH SUBSCRIBE] Falha ao verificar registro:',
+        verificationError
+      );
 
-      registered:
-        true,
+      return reply(
+        {
+          ok: false,
 
-      deviceId:
-        data?.device_id ??
-        body.deviceId,
-    });
+          version:
+            VERSION,
+
+          stage:
+            'verification',
+
+          error:
+            'O dispositivo foi enviado ao Supabase, mas não foi possível confirmar o registro.',
+
+          code:
+            verificationError
+              .code,
+
+          detail:
+            verificationError
+              .message,
+        },
+        500
+      );
+    }
+
+    if (
+      !verification ||
+      verification.active !==
+        true
+    ) {
+      return reply(
+        {
+          ok: false,
+
+          version:
+            VERSION,
+
+          stage:
+            'verification',
+
+          error:
+            'O dispositivo não foi encontrado como ativo após o registro.',
+        },
+        500
+      );
+    }
+
+    /* =====================================================
+       10. SUCESSO
+    ===================================================== */
+
+    console.info(
+      '[PUSH SUBSCRIBE] Registrado com sucesso:',
+      deviceId
+    );
+
+    return reply(
+      {
+        ok: true,
+
+        version:
+          VERSION,
+
+        stage:
+          'registered',
+
+        registered:
+          true,
+
+        backend:
+          'registered',
+
+        active:
+          true,
+
+        deviceId:
+          savedDevice
+            ?.device_id ??
+          deviceId,
+
+        timezone:
+          savedDevice
+            ?.timezone ??
+          timezone,
+      },
+      200
+    );
   } catch (error) {
     console.error(
       '[PUSH SUBSCRIBE][UNHANDLED]',
       error
     );
 
-    return response(
+    return reply(
       {
         ok: false,
 
@@ -496,9 +878,12 @@ export async function POST(
           'unhandled',
 
         error:
-          error instanceof Error
-            ? error.message
-            : 'Erro inesperado.',
+          'Erro inesperado ao registrar Push.',
+
+        detail:
+          safeError(
+            error
+          ),
       },
       500
     );
