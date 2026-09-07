@@ -29,7 +29,6 @@ import type {
 } from '@/lib/types';
 
 import {
-  cancelOccurrenceReminder,
   getPushStatus,
   registerServiceWorker,
   requestNotificationPermission,
@@ -39,12 +38,9 @@ import {
   unsubscribeFromPush,
 } from '@/lib/reminder-client';
 
-/**
- * Mantemos o import de cancelOccurrenceReminder acima
- * disponível para compatibilidade com reminder-client,
- * mesmo que esta página não precise chamá-lo diretamente.
- */
-void cancelOccurrenceReminder;
+/* =========================================================
+   TIPOS
+========================================================= */
 
 type BusyAction =
   | 'permission'
@@ -76,6 +72,10 @@ type PushStatusState = {
   ios?: boolean;
 };
 
+/* =========================================================
+   HELPERS
+========================================================= */
+
 function getPermissionLabel(
   permission:
     | NotificationPermission
@@ -95,6 +95,28 @@ function getPermissionLabel(
       return 'Não suportada';
   }
 }
+
+function getErrorMessage(
+  error: unknown,
+  fallback: string
+): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (
+    typeof error === 'string' &&
+    error.trim()
+  ) {
+    return error;
+  }
+
+  return fallback;
+}
+
+/* =========================================================
+   COMPONENTE DE STATUS
+========================================================= */
 
 function StatusItem({
   label,
@@ -125,6 +147,10 @@ function StatusItem({
     </div>
   );
 }
+
+/* =========================================================
+   PÁGINA
+========================================================= */
 
 export default function SettingsPage() {
   const settings =
@@ -188,15 +214,16 @@ export default function SettingsPage() {
           }
         } catch (error) {
           console.error(
-            '[Settings] Falha ao consultar status Push:',
+            '[Settings] Falha ao consultar status:',
             error
           );
 
           if (showMessage) {
             setMessage(
-              error instanceof Error
-                ? error.message
-                : 'Não foi possível consultar o status do Push.'
+              getErrorMessage(
+                error,
+                'Não foi possível consultar o status do Push.'
+              )
             );
           }
         }
@@ -209,19 +236,25 @@ export default function SettingsPage() {
   ======================================================= */
 
   useEffect(() => {
-    let mounted = true;
+    let active = true;
 
     async function initialize() {
       try {
+        /**
+         * Prepara o Service Worker ANTES de o usuário
+         * tocar no botão de ativação.
+         *
+         * Isso é muito importante no iPhone.
+         */
         await registerServiceWorker();
       } catch (error) {
         console.warn(
-          '[Settings] Service Worker:',
+          '[Settings] Falha ao preparar Service Worker:',
           error
         );
       }
 
-      if (!mounted) {
+      if (!active) {
         return;
       }
 
@@ -231,24 +264,13 @@ export default function SettingsPage() {
     void initialize();
 
     return () => {
-      mounted = false;
+      active = false;
     };
   }, [refreshPushStatus]);
 
   /* =======================================================
-     UTILITÁRIOS
+     ALTERAR CONFIGURAÇÕES
   ======================================================= */
-
-  function errorMessage(
-    error: unknown,
-    fallback: string
-  ): string {
-    if (error instanceof Error) {
-      return error.message;
-    }
-
-    return fallback;
-  }
 
   async function syncAfterSettingsChange() {
     const currentDevice =
@@ -267,7 +289,7 @@ export default function SettingsPage() {
       await syncReminderJobs();
     } catch (error) {
       console.warn(
-        '[Settings] Configuração salva localmente, mas sincronização falhou:',
+        '[Settings] Configuração salva, mas sync falhou:',
         error
       );
     }
@@ -288,7 +310,7 @@ export default function SettingsPage() {
   }
 
   /* =======================================================
-     1. PEDIR PERMISSÃO
+     1. PERMISSÃO
   ======================================================= */
 
   async function allowNotifications() {
@@ -311,14 +333,19 @@ export default function SettingsPage() {
         'granted'
       ) {
         setMessage(
-          'Permissão concedida. Agora toque em "Ativar Push" para concluir.'
+          'Permissão concedida. Agora toque em "2. Ativar Push".'
         );
       }
 
       await refreshPushStatus();
     } catch (error) {
+      console.error(
+        '[Settings] Permissão:',
+        error
+      );
+
       setMessage(
-        errorMessage(
+        getErrorMessage(
           error,
           'Não foi possível solicitar a permissão.'
         )
@@ -347,51 +374,35 @@ export default function SettingsPage() {
 
     try {
       /**
-       * Garante que o status que estamos vendo
-       * não está desatualizado.
+       * MUITO IMPORTANTE:
+       *
+       * NÃO coloque nenhum await antes desta chamada.
+       *
+       * No iOS, pushManager.subscribe() precisa ocorrer
+       * diretamente a partir do clique do usuário.
+       *
+       * subscribeToPush() foi preparado justamente para
+       * fazer pushManager.subscribe() antes de qualquer
+       * operação assíncrona desnecessária.
        */
-      const currentStatus =
-        await getPushStatus();
-
-      if (
-        currentStatus
-          .permission ===
-        'denied'
-      ) {
-        throw new Error(
-          'As notificações estão bloqueadas. No iPhone, abra Ajustes → Notificações → Medicamentos e ative "Permitir Notificações".'
-        );
-      }
-
-      if (
-        currentStatus
-          .permission !==
-        'granted'
-      ) {
-        throw new Error(
-          'Primeiro toque em "1. Permitir notificações". Depois volte e toque em "2. Ativar Push".'
-        );
-      }
-
       await subscribeToPush();
-
-      await refreshPushStatus();
 
       setMessage(
         'Push ativado com sucesso neste dispositivo.'
       );
+
+      await refreshPushStatus();
     } catch (error) {
-      const text =
-        errorMessage(
-          error,
-          'Falha ao ativar Push.'
-        );
-
-      setMessage(text);
-
       console.error(
         '[Settings] Falha ao ativar Push:',
         error
+      );
+
+      setMessage(
+        getErrorMessage(
+          error,
+          'Falha ao ativar Push.'
+        )
       );
 
       await refreshPushStatus();
@@ -418,14 +429,19 @@ export default function SettingsPage() {
     try {
       await unsubscribeFromPush();
 
-      await refreshPushStatus();
-
       setMessage(
         'Push desativado neste dispositivo.'
       );
+
+      await refreshPushStatus();
     } catch (error) {
+      console.error(
+        '[Settings] Falha ao desativar Push:',
+        error
+      );
+
       setMessage(
-        errorMessage(
+        getErrorMessage(
           error,
           'Não foi possível desativar o Push.'
         )
@@ -456,22 +472,31 @@ export default function SettingsPage() {
       await testLocalNotification();
 
       setMessage(
-        'Notificação de teste enviada. Este teste confirma a permissão e o Service Worker; ele não testa o cron do servidor.'
+        'Notificação de teste enviada. Este teste confirma permissão + Service Worker; não testa o cron do servidor.'
       );
+
+      await refreshPushStatus();
     } catch (error) {
+      console.error(
+        '[Settings] Teste de notificação:',
+        error
+      );
+
       setMessage(
-        errorMessage(
+        getErrorMessage(
           error,
           'Falha ao enviar a notificação de teste.'
         )
       );
+
+      await refreshPushStatus();
     } finally {
       setBusy(null);
     }
   }
 
   /* =======================================================
-     ATUALIZAR STATUS MANUALMENTE
+     ATUALIZAR STATUS
   ======================================================= */
 
   async function manualRefreshStatus() {
@@ -495,7 +520,7 @@ export default function SettingsPage() {
   }
 
   /* =======================================================
-     BACKUP
+     EXPORTAR BACKUP
   ======================================================= */
 
   async function exportBackup() {
@@ -517,7 +542,9 @@ export default function SettingsPage() {
       ] =
         await Promise.all([
           db.medications.toArray(),
+
           db.logs.toArray(),
+
           db.settings.get(
             'settings'
           ),
@@ -583,10 +610,11 @@ export default function SettingsPage() {
       anchor.remove();
 
       window.setTimeout(
-        () =>
+        () => {
           URL.revokeObjectURL(
             url
-          ),
+          );
+        },
         1000
       );
 
@@ -594,8 +622,13 @@ export default function SettingsPage() {
         'Backup exportado.'
       );
     } catch (error) {
+      console.error(
+        '[Settings] Exportar backup:',
+        error
+      );
+
       setMessage(
-        errorMessage(
+        getErrorMessage(
           error,
           'Não foi possível exportar o backup.'
         )
@@ -604,6 +637,10 @@ export default function SettingsPage() {
       setBusy(null);
     }
   }
+
+  /* =======================================================
+     IMPORTAR BACKUP
+  ======================================================= */
 
   async function importBackup(
     file?: File
@@ -625,6 +662,9 @@ export default function SettingsPage() {
       const text =
         await file.text();
 
+      /**
+       * Primeiro tratamos tudo como unknown.
+       */
       const data =
         JSON.parse(
           text
@@ -634,18 +674,47 @@ export default function SettingsPage() {
           settings?: Partial<AppSettings>;
         };
 
+      /**
+       * Validação mínima do arquivo.
+       */
       if (
         !Array.isArray(
           data.medications
-        ) ||
+        )
+      ) {
+        throw new Error(
+          'Backup inválido: lista de medicamentos não encontrada.'
+        );
+      }
+
+      if (
         !Array.isArray(
           data.logs
         )
       ) {
         throw new Error(
-          'Backup inválido.'
+          'Backup inválido: histórico não encontrado.'
         );
       }
+
+      /**
+       * IMPORTANTE:
+       *
+       * Criamos variáveis tipadas antes de entrar
+       * no callback da transação Dexie.
+       *
+       * Isso corrige exatamente o erro da Vercel:
+       *
+       * Argument of type 'unknown' is not assignable...
+       */
+      const medications =
+        data.medications as Medication[];
+
+      const logs =
+        data.logs as MedicationLog[];
+
+      const importedSettings =
+        data.settings;
 
       await db.transaction(
         'rw',
@@ -656,22 +725,23 @@ export default function SettingsPage() {
 
         async () => {
           await db.medications.clear();
+
           await db.logs.clear();
 
           await db.medications.bulkPut(
-            data.medications
+            medications
           );
 
           await db.logs.bulkPut(
-            data.logs
+            logs
           );
 
           if (
-            data.settings
+            importedSettings
           ) {
             await db.settings.put({
               ...defaultSettings,
-              ...data.settings,
+              ...importedSettings,
               id: 'settings',
             });
           }
@@ -684,8 +754,13 @@ export default function SettingsPage() {
         'Backup importado com sucesso.'
       );
     } catch (error) {
+      console.error(
+        '[Settings] Importar backup:',
+        error
+      );
+
       setMessage(
-        errorMessage(
+        getErrorMessage(
           error,
           'Não foi possível importar o backup.'
         )
@@ -696,7 +771,7 @@ export default function SettingsPage() {
   }
 
   /* =======================================================
-     HISTÓRICO
+     APAGAR HISTÓRICO
   ======================================================= */
 
   async function clearHistory() {
@@ -728,8 +803,13 @@ export default function SettingsPage() {
         'Histórico apagado.'
       );
     } catch (error) {
+      console.error(
+        '[Settings] Apagar histórico:',
+        error
+      );
+
       setMessage(
-        errorMessage(
+        getErrorMessage(
           error,
           'Não foi possível apagar o histórico.'
         )
@@ -740,7 +820,7 @@ export default function SettingsPage() {
   }
 
   /* =======================================================
-     RESET
+     RESTAURAR CONFIGURAÇÕES
   ======================================================= */
 
   async function resetSettings() {
@@ -766,6 +846,7 @@ export default function SettingsPage() {
     try {
       await db.settings.put({
         ...defaultSettings,
+
         onboardingDone:
           true,
       });
@@ -776,8 +857,13 @@ export default function SettingsPage() {
         'Configurações restauradas.'
       );
     } catch (error) {
+      console.error(
+        '[Settings] Restaurar configurações:',
+        error
+      );
+
       setMessage(
-        errorMessage(
+        getErrorMessage(
           error,
           'Não foi possível restaurar as configurações.'
         )
@@ -812,6 +898,10 @@ export default function SettingsPage() {
       </div>
     );
   }
+
+  /* =======================================================
+     STATUS DERIVADO
+  ======================================================= */
 
   const permissionGranted =
     pushStatus
@@ -858,18 +948,22 @@ export default function SettingsPage() {
 
         <p className="muted mt-2 text-sm leading-relaxed">
           Para receber lembretes mesmo com o aplicativo
-          fechado, primeiro conceda a permissão e depois
-          ative o Web Push.
+          fechado, primeiro conceda a permissão do iPhone
+          e depois ative o Web Push.
         </p>
+
+        {/* IPHONE FORA DO PWA */}
 
         {pushStatus?.ios &&
           !pushStatus.standalone && (
             <div className="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm font-bold text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
-              No iPhone/iPad, abra este site pelo ícone
-              instalado na Tela de Início. O Web Push não
-              deve ser ativado por uma aba comum do Safari.
+              No iPhone/iPad, abra este aplicativo pelo
+              ícone instalado na Tela de Início. Não tente
+              ativar Web Push em uma aba comum do Safari.
             </div>
           )}
+
+        {/* PERMISSÃO BLOQUEADA */}
 
         {permissionDenied && (
           <div className="mt-4 rounded-xl border border-rose-300 bg-rose-50 p-4 text-sm font-bold text-rose-900 dark:border-rose-800 dark:bg-rose-950 dark:text-rose-100">
@@ -935,14 +1029,16 @@ export default function SettingsPage() {
             label="Inscrição no navegador"
             value={
               pushStatus
-                ? pushStatus.hasBrowserSubscription
+                ? pushStatus
+                    .hasBrowserSubscription
                   ? 'Criada'
                   : 'Não criada'
                 : 'Verificando...'
             }
             ok={
               pushStatus
-                ? pushStatus.hasBrowserSubscription
+                ? pushStatus
+                    .hasBrowserSubscription
                 : undefined
             }
           />
@@ -951,16 +1047,19 @@ export default function SettingsPage() {
             label="Backend"
             value={
               pushStatus
-                ? pushStatus.backendMarkedSubscribed
+                ? pushStatus
+                    .backendMarkedSubscribed
                   ? 'Registrado'
                   : 'Não registrado'
-                : device?.pushSubscribed
+                : device
+                    ?.pushSubscribed
                   ? 'Registrado'
                   : 'Verificando...'
             }
             ok={
               pushStatus
-                ? pushStatus.backendMarkedSubscribed
+                ? pushStatus
+                    .backendMarkedSubscribed
                 : undefined
             }
           />
@@ -972,11 +1071,13 @@ export default function SettingsPage() {
                 ? 'ATIVO'
                 : 'INATIVO'
             }
-            ok={pushActive}
+            ok={
+              pushActive
+            }
           />
         </div>
 
-        {/* BOTÕES PRINCIPAIS */}
+        {/* AÇÕES */}
 
         <div className="mt-5 grid gap-2 sm:grid-cols-2">
           <button
@@ -1010,7 +1111,8 @@ export default function SettingsPage() {
               enablePush
             }
           >
-            {busy === 'push'
+            {busy ===
+            'push'
               ? 'Ativando Push...'
               : pushActive
                 ? '✓ Push ativo'
@@ -1028,7 +1130,8 @@ export default function SettingsPage() {
               testNotification
             }
           >
-            {busy === 'test'
+            {busy ===
+            'test'
               ? 'Enviando teste...'
               : 'Testar notificação'}
           </button>
@@ -1072,6 +1175,8 @@ export default function SettingsPage() {
           )}
         </div>
 
+        {/* PASSO A PASSO */}
+
         <div className="mt-5 rounded-xl border border-slate-200 p-4 dark:border-slate-700">
           <p className="text-sm font-black">
             Ordem correta no iPhone
@@ -1079,7 +1184,7 @@ export default function SettingsPage() {
 
           <ol className="muted mt-2 list-decimal space-y-1 pl-5 text-sm">
             <li>
-              Abra pelo ícone da Tela de Início.
+              Abra o aplicativo pelo ícone da Tela de Início.
             </li>
 
             <li>
@@ -1095,30 +1200,34 @@ export default function SettingsPage() {
             </li>
 
             <li>
-              O status deve mostrar navegador criado,
-              backend registrado e Web Push ativo.
+              Confira se navegador, backend e Web Push
+              ficaram ativos.
             </li>
           </ol>
         </div>
 
-        {/* CONFIGURAÇÕES DOS LEMBRETES */}
+        {/* CONFIGURAÇÕES DE LEMBRETES */}
 
         <div className="mt-5 grid gap-3 sm:grid-cols-2">
           <label className="flex gap-3 font-bold">
             <input
               type="checkbox"
               checked={
-                settings.soundEnabled
+                settings
+                  .soundEnabled
               }
-              onChange={(event) =>
+              onChange={(
+                event
+              ) => {
                 void patchSettings(
                   {
                     soundEnabled:
-                      event.target.checked,
+                      event.target
+                        .checked,
                   },
                   true
-                )
-              }
+                );
+              }}
             />
 
             Som, quando suportado
@@ -1128,17 +1237,21 @@ export default function SettingsPage() {
             <input
               type="checkbox"
               checked={
-                settings.vibrationEnabled
+                settings
+                  .vibrationEnabled
               }
-              onChange={(event) =>
+              onChange={(
+                event
+              ) => {
                 void patchSettings(
                   {
                     vibrationEnabled:
-                      event.target.checked,
+                      event.target
+                        .checked,
                   },
                   true
-                )
-              }
+                );
+              }}
             />
 
             Vibração, quando suportada
@@ -1152,19 +1265,23 @@ export default function SettingsPage() {
             <select
               className="input"
               value={
-                settings.repeatMinutes
+                settings
+                  .repeatMinutes
               }
-              onChange={(event) =>
+              onChange={(
+                event
+              ) => {
                 void patchSettings(
                   {
                     repeatMinutes:
                       Number(
-                        event.target.value
+                        event.target
+                          .value
                       ) as AppSettings['repeatMinutes'],
                   },
                   true
-                )
-              }
+                );
+              }}
             >
               {[
                 10,
@@ -1182,8 +1299,7 @@ export default function SettingsPage() {
                       minutes
                     }
                   >
-                    {minutes}{' '}
-                    minutos
+                    {minutes} minutos
                   </option>
                 )
               )}
@@ -1198,7 +1314,9 @@ export default function SettingsPage() {
                   settings
                     .quietHoursEnabled
                 }
-                onChange={(event) =>
+                onChange={(
+                  event
+                ) => {
                   void patchSettings(
                     {
                       quietHoursEnabled:
@@ -1206,8 +1324,8 @@ export default function SettingsPage() {
                           .checked,
                     },
                     true
-                  )
-                }
+                  );
+                }}
               />
 
               Horário silencioso
@@ -1221,9 +1339,12 @@ export default function SettingsPage() {
                   className="input"
                   type="time"
                   value={
-                    settings.quietStart
+                    settings
+                      .quietStart
                   }
-                  onChange={(event) =>
+                  onChange={(
+                    event
+                  ) => {
                     void patchSettings(
                       {
                         quietStart:
@@ -1231,8 +1352,8 @@ export default function SettingsPage() {
                             .value,
                       },
                       true
-                    )
-                  }
+                    );
+                  }}
                 />
 
                 <input
@@ -1240,9 +1361,12 @@ export default function SettingsPage() {
                   className="input"
                   type="time"
                   value={
-                    settings.quietEnd
+                    settings
+                      .quietEnd
                   }
-                  onChange={(event) =>
+                  onChange={(
+                    event
+                  ) => {
                     void patchSettings(
                       {
                         quietEnd:
@@ -1250,8 +1374,8 @@ export default function SettingsPage() {
                             .value,
                       },
                       true
-                    )
-                  }
+                    );
+                  }}
                 />
               </div>
             )}
@@ -1277,12 +1401,10 @@ export default function SettingsPage() {
                 'system',
                 'Automático',
               ],
-
               [
                 'light',
                 'Claro',
               ],
-
               [
                 'dark',
                 'Escuro',
@@ -1297,17 +1419,18 @@ export default function SettingsPage() {
                 type="button"
                 key={value}
                 className={`rounded-xl border px-2 py-3 text-sm font-black ${
-                  settings.theme ===
+                  settings
+                    .theme ===
                   value
                     ? 'border-sky-500 bg-sky-50 dark:bg-sky-950'
                     : 'border-slate-200 dark:border-slate-700'
                 }`}
-                onClick={() =>
+                onClick={() => {
                   void patchSettings({
                     theme:
                       value,
-                  })
-                }
+                  });
+                }}
               >
                 {label}
               </button>
@@ -1342,7 +1465,8 @@ export default function SettingsPage() {
               size={17}
             />
 
-            {busy === 'backup'
+            {busy ===
+            'backup'
               ? 'Exportando...'
               : 'Exportar backup'}
           </button>
@@ -1353,20 +1477,25 @@ export default function SettingsPage() {
             disabled={
               Boolean(busy)
             }
-            onClick={() =>
+            onClick={() => {
               fileRef.current
-                ?.click()
-            }
+                ?.click();
+            }}
           >
             <Upload
               size={17}
             />
 
-            Importar backup
+            {busy ===
+            'import'
+              ? 'Importando...'
+              : 'Importar backup'}
           </button>
 
           <input
-            ref={fileRef}
+            ref={
+              fileRef
+            }
             type="file"
             className="hidden"
             accept="application/json,.json"
@@ -1416,7 +1545,8 @@ export default function SettingsPage() {
               resetSettings
             }
           >
-            {busy === 'reset'
+            {busy ===
+            'reset'
               ? 'Restaurando...'
               : 'Restaurar configurações'}
           </button>
@@ -1424,7 +1554,7 @@ export default function SettingsPage() {
       </section>
 
       {/* ===================================================
-          SEGURANÇA
+          SOBRE
       =================================================== */}
 
       <section className="card p-5">
@@ -1446,8 +1576,7 @@ export default function SettingsPage() {
         <p className="muted mt-3 text-sm leading-relaxed">
           No iPhone/iPad: abra o endereço pelo Safari →
           Compartilhar → Adicionar à Tela de Início. Depois,
-          abra sempre pelo ícone instalado para usar Web
-          Push.
+          abra pelo ícone instalado para utilizar Web Push.
         </p>
       </section>
 
