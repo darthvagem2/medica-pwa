@@ -2,101 +2,136 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
+function reply(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    },
+  });
+}
+
 export async function GET(request: Request) {
-  const secret =
-    process.env.CRON_SECRET?.trim();
+  const secret = process.env.CRON_SECRET?.trim();
 
   if (!secret) {
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        version: 'ENV_ONLY_V1',
-        stage: 'cron-secret',
-        error: 'CRON_SECRET ausente',
-      }),
+    return reply(
       {
-        status: 503,
-        headers: {
-          'content-type': 'application/json',
-          'cache-control': 'no-store',
-        },
-      }
+        ok: false,
+        version: 'ENV_ONLY_V2',
+        stage: 'cron-secret',
+      },
+      503
     );
   }
-
-  const authorization =
-    request.headers.get('authorization');
 
   if (
-    authorization !==
+    request.headers.get('authorization') !==
     `Bearer ${secret}`
   ) {
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        version: 'ENV_ONLY_V1',
-        stage: 'authorization',
-        error: 'Unauthorized',
-      }),
+    return reply(
       {
-        status: 401,
-        headers: {
-          'content-type': 'application/json',
-          'cache-control': 'no-store',
-        },
-      }
+        ok: false,
+        version: 'ENV_ONLY_V2',
+        stage: 'authorization',
+      },
+      401
     );
   }
 
-  return new Response(
-    JSON.stringify({
+  const databaseUrl =
+    process.env.DATABASE_URL?.trim();
+
+  if (!databaseUrl) {
+    return reply(
+      {
+        ok: false,
+        version: 'ENV_ONLY_V2',
+        stage: 'database-url',
+      },
+      503
+    );
+  }
+
+  try {
+    const parsed =
+      new URL(databaseUrl);
+
+    const username =
+      decodeURIComponent(
+        parsed.username
+      );
+
+    return reply({
       ok: true,
 
       version:
-        'ENV_ONLY_V1',
+        'ENV_ONLY_V2',
 
       stage:
-        'environment-ok',
+        'database-url-ok',
 
-      environment: {
-        databaseUrl:
-          Boolean(
-            process.env.DATABASE_URL
+      database: {
+        protocol:
+          parsed.protocol,
+
+        username,
+
+        host:
+          parsed.hostname,
+
+        port:
+          parsed.port ||
+          'default',
+
+        database:
+          parsed.pathname,
+
+        passwordPresent:
+          parsed.password.length > 0,
+
+        transactionPooler:
+          parsed.hostname.includes(
+            '.pooler.supabase.com'
+          ) &&
+          parsed.port === '6543',
+
+        poolerUsername:
+          username.startsWith(
+            'postgres.'
           ),
+      },
 
-        databaseUrlLength:
-          process.env.DATABASE_URL
-            ?.length ?? 0,
-
-        vapidPublic:
+      vapid: {
+        public:
           Boolean(
             process.env
               .NEXT_PUBLIC_VAPID_PUBLIC_KEY
           ),
 
-        vapidPrivate:
+        private:
           Boolean(
             process.env
               .VAPID_PRIVATE_KEY
           ),
 
-        vapidSubject:
+        subject:
           Boolean(
             process.env
               .VAPID_SUBJECT
           ),
       },
-    }),
-    {
-      status: 200,
-
-      headers: {
-        'content-type':
-          'application/json; charset=utf-8',
-
-        'cache-control':
-          'no-store',
+    });
+  } catch {
+    return reply(
+      {
+        ok: false,
+        version: 'ENV_ONLY_V2',
+        stage: 'database-url-format',
+        error: 'DATABASE_URL inválida',
       },
-    }
-  );
+      500
+    );
+  }
 }
