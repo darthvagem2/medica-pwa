@@ -1,467 +1,208 @@
 import { createClient } from '@supabase/supabase-js';
-
-import type {
-  PushSubscription as WebPushSubscription,
-} from 'web-push';
-
-import {
-  createPublicKey,
-  verify as cryptoVerify,
-} from 'node:crypto';
-
-import {
-  fromZonedTime,
-  toZonedTime,
-} from 'date-fns-tz';
-
-import {
-  getWebPush,
-} from '@/lib/push-server';
+import type { PushSubscription as WebPushSubscription } from 'web-push';
+import { fromZonedTime, toZonedTime } from 'date-fns-tz';
+import { getWebPush } from '@/lib/push-server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-const CRON_VERSION =
-  'SUPABASE_CRON_V3_VAPID_DEBUG';
+const CRON_VERSION = 'SUPABASE_CRON_V3_VAPID_DEBUG';
 
-/* =========================================================
-   TIPOS
-========================================================= */
-
-type ReminderPhase =
-  | 'main'
-  | 'deadline'
-  | 'repeat'
-  | 'done';
+type ReminderPhase = 'main' | 'deadline' | 'repeat' | 'done';
 
 type PushDeviceRow = {
   subscription: unknown;
-
-  timezone:
-    | string
-    | null;
-
-  quiet_enabled:
-    | boolean
-    | null;
-
-  quiet_start:
-    | string
-    | null;
-
-  quiet_end:
-    | string
-    | null;
-
-  active:
-    | boolean
-    | null;
+  timezone: string | null;
+  quiet_enabled: boolean | null;
+  quiet_start: string | null;
+  quiet_end: string | null;
+  active: boolean | null;
 };
 
 type ReminderJobRow = {
   device_id: string;
-
   occurrence_id: string;
-
   medication_id: string;
-
   medication_label: string;
-
   scheduled_at: string;
-
-  deadline_at:
-    | string
-    | null;
-
+  deadline_at: string | null;
   next_notify_at: string;
-
   repeat_minutes: number;
-
   phase: ReminderPhase;
-
   sound: boolean;
-
   vibration: boolean;
-
   required: boolean;
-
-  url:
-    | string
-    | null;
-
+  url: string | null;
   active: boolean;
-
-  last_sent_at:
-    | string
-    | null;
-
-  locked_until:
-    | string
-    | null;
-
-  push_devices:
-    | PushDeviceRow
-    | PushDeviceRow[]
-    | null;
+  last_sent_at: string | null;
+  locked_until: string | null;
+  push_devices: PushDeviceRow | PushDeviceRow[] | null;
 };
 
 type VapidDebug = {
-  serverNow: string;
-
-  endpointOrigin:
-    | string
-    | null;
-
-  endpointHost:
-    | string
-    | null;
-
-  applePushEndpoint:
-    boolean;
-
-  authorizationScheme:
-    | string
-    | null;
-
-  jwtExtracted:
-    boolean;
-
-  jwtSegments:
-    number;
-
-  alg:
-    | string
-    | null;
-
-  typ:
-    | string
-    | null;
-
-  aud:
-    | string
-    | null;
-
-  audMatchesEndpointOrigin:
-    boolean | null;
-
-  subPreview:
-    | string
-    | null;
-
-  subValid:
-    boolean | null;
-
-  exp:
-    | number
-    | null;
-
-  expIso:
-    | string
-    | null;
-
-  expSecondsFromNow:
-    | number
-    | null;
-
-  expInFuture:
-    boolean | null;
-
-  expWithin24Hours:
-    boolean | null;
-
-  authorizationPublicKeyPresent:
-    boolean;
-
-  authorizationPublicKeyMatchesConfigured:
-    boolean | null;
-
-  configuredPublicKeyBytes:
-    number | null;
-
-  configuredPrivateKeyPresent:
-    boolean;
-
-  signaturePresent:
-    boolean;
-
-  signatureBytes:
-    number | null;
-
-  signatureValidWithConfiguredPublicKey:
-    boolean | null;
-
-  debugError:
-    | string
-    | null;
+  endpointOrigin: string | null;
+  endpointHost: string | null;
+  applePushEndpoint: boolean;
+  authorizationScheme: string | null;
+  jwtExtracted: boolean;
+  jwtSegments: number;
+  alg: string | null;
+  typ: string | null;
+  aud: string | null;
+  audMatchesEndpointOrigin: boolean | null;
+  subPreview: string | null;
+  subValid: boolean | null;
+  exp: number | null;
+  expIso: string | null;
+  expSecondsFromNow: number | null;
+  expInFuture: boolean | null;
+  expWithin24Hours: boolean | null;
+  authorizationPublicKeyPresent: boolean;
+  authorizationPublicKeyMatchesConfigured: boolean | null;
+  configuredPublicKeyBytes: number | null;
+  configuredPrivateKeyPresent: boolean;
+  pairValidatedByPushServer: boolean;
+  debugError: string | null;
 };
 
 type PushErrorDiagnostic = {
   occurrenceId: string;
-
   medicationLabel: string;
-
-  statusCode:
-    | number
-    | null;
-
+  statusCode: number | null;
   message: string;
-
-  reason:
-    | string
-    | null;
-
+  reason: string | null;
   body: unknown;
-
-  vapidDebug:
-    VapidDebug | null;
+  vapidDebug: VapidDebug | null;
 };
 
-/* =========================================================
-   RESPONSE
-========================================================= */
-
-function reply(
-  body: unknown,
-  status = 200
-) {
-  return new Response(
-    JSON.stringify(
-      body,
-      null,
-      2
-    ),
-    {
-      status,
-
-      headers: {
-        'content-type':
-          'application/json; charset=utf-8',
-
-        'cache-control':
-          'no-store',
-      },
-    }
-  );
+function reply(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    },
+  });
 }
 
-/* =========================================================
-   HELPERS
-========================================================= */
+function cleanEnv(value: string | undefined): string {
+  if (!value) return '';
 
-function cleanEnv(
-  value:
-    | string
-    | undefined
-): string {
-  if (!value) {
-    return '';
-  }
-
-  let result =
-    value.trim();
+  let result = value.trim();
 
   if (
-    (
-      result.startsWith('"') &&
-      result.endsWith('"')
-    ) ||
-    (
-      result.startsWith("'") &&
-      result.endsWith("'")
-    )
+    (result.startsWith('"') && result.endsWith('"')) ||
+    (result.startsWith("'") && result.endsWith("'"))
   ) {
-    result =
-      result
-        .slice(1, -1)
-        .trim();
+    result = result.slice(1, -1).trim();
   }
 
   return result;
 }
 
-function safeError(
-  error: unknown
-): string {
+function safeError(error: unknown): string {
   let message: string;
 
-  if (
-    error instanceof Error
-  ) {
-    message =
-      error.message;
-  } else if (
-    typeof error ===
-      'string'
-  ) {
-    message =
-      error;
+  if (error instanceof Error) {
+    message = error.message;
+  } else if (typeof error === 'string') {
+    message = error;
   } else {
     try {
-      message =
-        JSON.stringify(
-          error
-        );
+      message = JSON.stringify(error);
     } catch {
-      message =
-        String(error);
+      message = String(error);
     }
   }
 
   return message
-    .replace(
-      /Bearer\s+\S+/gi,
-      'Bearer ***'
-    )
-    .replace(
-      /sb_secret_[A-Za-z0-9_-]+/gi,
-      'sb_secret_***'
-    );
+    .replace(/Bearer\s+\S+/gi, 'Bearer ***')
+    .replace(/sb_secret_[A-Za-z0-9_-]+/gi, 'sb_secret_***');
 }
 
-/* =========================================================
-   ERRO WEB PUSH
-========================================================= */
-
-function getPushStatusCode(
-  error: unknown
-): number | null {
-  if (
-    typeof error !==
-      'object' ||
-    error === null
-  ) {
+function getPushStatusCode(error: unknown): number | null {
+  if (typeof error !== 'object' || error === null) {
     return null;
   }
 
-  const raw =
-    error as {
-      statusCode?: unknown;
-    };
+  const raw = error as {
+    statusCode?: unknown;
+  };
 
-  const status =
-    Number(
-      raw.statusCode
-    );
+  const status = Number(raw.statusCode);
 
-  return Number.isFinite(
-    status
-  )
-    ? status
-    : null;
+  return Number.isFinite(status) ? status : null;
 }
 
-function getPushErrorBody(
-  error: unknown
-): unknown {
-  if (
-    typeof error !==
-      'object' ||
-    error === null
-  ) {
+function getPushErrorBody(error: unknown): unknown {
+  if (typeof error !== 'object' || error === null) {
     return null;
   }
 
-  const raw =
-    error as {
-      body?: unknown;
-    };
+  const raw = error as {
+    body?: unknown;
+  };
 
-  const body =
-    raw.body;
+  const body = raw.body;
 
-  if (
-    body === undefined ||
-    body === null
-  ) {
+  if (body === undefined || body === null) {
     return null;
   }
 
-  if (
-    typeof body ===
-      'string'
-  ) {
-    const text =
-      body.trim();
+  if (typeof body === 'string') {
+    const text = body.trim();
 
     if (!text) {
       return null;
     }
 
     try {
-      return JSON.parse(
-        text
-      );
+      return JSON.parse(text);
     } catch {
       return text;
     }
   }
 
-  if (
-    body instanceof
-      Uint8Array
-  ) {
-    try {
-      const text =
-        Buffer
-          .from(body)
-          .toString('utf8')
-          .trim();
+  if (body instanceof Uint8Array) {
+    const text = Buffer.from(body)
+      .toString('utf8')
+      .trim();
 
-      if (!text) {
-        return null;
-      }
-
-      try {
-        return JSON.parse(
-          text
-        );
-      } catch {
-        return text;
-      }
-    } catch {
+    if (!text) {
       return null;
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
     }
   }
 
   return body;
 }
 
-function getPushErrorReason(
-  body: unknown
-): string | null {
-  if (
-    typeof body ===
-      'object' &&
-    body !== null
-  ) {
-    const raw =
-      body as {
-        reason?: unknown;
-      };
+function getPushErrorReason(body: unknown): string | null {
+  if (typeof body === 'object' && body !== null) {
+    const raw = body as {
+      reason?: unknown;
+    };
 
     if (
-      typeof raw.reason ===
-        'string' &&
+      typeof raw.reason === 'string' &&
       raw.reason.trim()
     ) {
-      return raw.reason
-        .trim();
+      return raw.reason.trim();
     }
   }
 
-  if (
-    typeof body ===
-      'string'
-  ) {
-    const match =
-      body.match(
-        /"reason"\s*:\s*"([^"]+)"/i
-      );
+  if (typeof body === 'string') {
+    const match = body.match(
+      /"reason"\s*:\s*"([^"]+)"/i
+    );
 
-    if (
-      match?.[1]
-    ) {
+    if (match && match[1]) {
       return match[1];
     }
   }
@@ -469,25 +210,14 @@ function getPushErrorReason(
   return null;
 }
 
-/* =========================================================
-   SUBSCRIPTION
-========================================================= */
-
 function parseSubscription(
   value: unknown
 ): WebPushSubscription {
-  let parsed:
-    unknown = value;
+  let parsed = value;
 
-  if (
-    typeof parsed ===
-      'string'
-  ) {
+  if (typeof parsed === 'string') {
     try {
-      parsed =
-        JSON.parse(
-          parsed
-        );
+      parsed = JSON.parse(parsed);
     } catch {
       throw new Error(
         'Subscription contém JSON inválido.'
@@ -496,8 +226,7 @@ function parseSubscription(
   }
 
   if (
-    typeof parsed !==
-      'object' ||
+    typeof parsed !== 'object' ||
     parsed === null
   ) {
     throw new Error(
@@ -505,38 +234,27 @@ function parseSubscription(
     );
   }
 
-  const raw =
-    parsed as {
-      endpoint?: unknown;
-
-      keys?: {
-        p256dh?: unknown;
-        auth?: unknown;
-      };
+  const raw = parsed as {
+    endpoint?: unknown;
+    keys?: {
+      p256dh?: unknown;
+      auth?: unknown;
     };
+  };
 
   const endpoint =
-    typeof raw.endpoint ===
-      'string'
+    typeof raw.endpoint === 'string'
       ? raw.endpoint.trim()
       : '';
 
   const p256dh =
-    typeof raw.keys
-      ?.p256dh ===
-      'string'
-      ? raw.keys
-          .p256dh
-          .trim()
+    typeof raw.keys?.p256dh === 'string'
+      ? raw.keys.p256dh.trim()
       : '';
 
   const auth =
-    typeof raw.keys
-      ?.auth ===
-      'string'
-      ? raw.keys
-          .auth
-          .trim()
+    typeof raw.keys?.auth === 'string'
+      ? raw.keys.auth.trim()
       : '';
 
   if (!endpoint) {
@@ -559,7 +277,6 @@ function parseSubscription(
 
   return {
     endpoint,
-
     keys: {
       p256dh,
       auth,
@@ -567,847 +284,32 @@ function parseSubscription(
   };
 }
 
-/* =========================================================
-   VAPID DEBUG
-========================================================= */
-
-function getHeader(
-  headers: unknown,
-  wantedName: string
-): string | null {
-  if (
-    typeof headers !==
-      'object' ||
-    headers === null
-  ) {
-    return null;
-  }
-
-  const record =
-    headers as Record<
-      string,
-      unknown
-    >;
-
-  const foundKey =
-    Object.keys(record)
-      .find(
-        key =>
-          key.toLowerCase() ===
-          wantedName
-            .toLowerCase()
-      );
-
-  if (!foundKey) {
-    return null;
-  }
-
-  const value =
-    record[foundKey];
-
-  return typeof value ===
-    'string'
-    ? value
-    : value ===
-        undefined ||
-      value === null
-      ? null
-      : String(value);
-}
-
-function extractJwt(
-  authorization:
-    | string
-    | null
-): string | null {
-  if (!authorization) {
-    return null;
-  }
-
-  /*
-   * Formato moderno:
-   *
-   * Authorization:
-   * vapid t=JWT,k=PUBLIC_KEY
-   */
-  const vapidToken =
-    authorization.match(
-      /(?:^|\s|,)t=([^,\s]+)/i
-    );
-
-  if (
-    vapidToken?.[1]
-  ) {
-    return vapidToken[1];
-  }
-
-  /*
-   * Formato antigo:
-   *
-   * Authorization:
-   * WebPush JWT
-   */
-  const parts =
-    authorization
-      .trim()
-      .split(/\s+/);
-
-  if (
-    parts.length >= 2 &&
-    parts[1]
-      .split('.')
-      .length === 3
-  ) {
-    return parts[1];
-  }
-
-  return null;
-}
-
-function extractAuthorizationPublicKey(
-  authorization:
-    | string
-    | null,
-
-  cryptoKey:
-    | string
-    | null
-): string | null {
-  if (
-    authorization
-  ) {
-    const match =
-      authorization.match(
-        /(?:^|\s|,)k=([^,\s]+)/i
-      );
-
-    if (
-      match?.[1]
-    ) {
-      return match[1];
-    }
-  }
-
-  /*
-   * Compatibilidade com
-   * versões antigas.
-   */
-  if (cryptoKey) {
-    const match =
-      cryptoKey.match(
-        /(?:^|;)\s*p256ecdsa=([^;,\s]+)/i
-      );
-
-    if (
-      match?.[1]
-    ) {
-      return match[1];
-    }
-  }
-
-  return null;
-}
-
-function decodeJwtJson(
-  segment: string
-): Record<
-  string,
-  unknown
-> | null {
-  try {
-    const text =
-      Buffer
-        .from(
-          segment,
-          'base64url'
-        )
-        .toString(
-          'utf8'
-        );
-
-    const parsed =
-      JSON.parse(
-        text
-      );
-
-    return (
-      typeof parsed ===
-        'object' &&
-      parsed !== null
-    )
-      ? parsed
-          as Record<
-            string,
-            unknown
-          >
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function subjectIsValid(
-  value: unknown
-): boolean {
-  if (
-    typeof value !==
-      'string' ||
-    !value.trim()
-  ) {
-    return false;
-  }
-
-  const subject =
-    value.trim();
-
-  if (
-    subject.startsWith(
-      'mailto:'
-    )
-  ) {
-    const email =
-      subject.slice(
-        'mailto:'.length
-      );
-
-    return (
-      email.includes('@') &&
-      !email
-        .toLowerCase()
-        .endsWith(
-          '@localhost'
-        )
-    );
-  }
-
-  try {
-    const url =
-      new URL(subject);
-
-    return (
-      url.protocol ===
-        'https:' &&
-      url.hostname !==
-        'localhost'
-    );
-  } catch {
-    return false;
-  }
-}
-
-function maskSubject(
-  value: unknown
-): string | null {
-  if (
-    typeof value !==
-      'string'
-  ) {
-    return null;
-  }
-
-  const subject =
-    value.trim();
-
-  if (
-    subject.startsWith(
-      'mailto:'
-    )
-  ) {
-    const email =
-      subject.slice(
-        7
-      );
-
-    const at =
-      email.indexOf('@');
-
-    if (at > 0) {
-      const name =
-        email.slice(
-          0,
-          at
-        );
-
-      const domain =
-        email.slice(
-          at + 1
-        );
-
-      const masked =
-        name.length <= 1
-          ? '*'
-          : `${name[0]}***`;
-
-      return (
-        `mailto:${masked}@${domain}`
-      );
-    }
-  }
-
-  /*
-   * URL pública não é segredo.
-   */
-  return subject;
-}
-
-/* =========================================================
-   VERIFICAR ASSINATURA JWT
-
-   Confirma matematicamente se o JWT foi assinado
-   por uma chave privada correspondente à chave
-   pública configurada na Vercel.
-========================================================= */
-
-function verifyJwtSignature(
-  jwt: string,
-  publicKeyBase64Url: string
-): {
-  valid:
-    boolean | null;
-
-  signatureBytes:
-    number | null;
-} {
-  try {
-    const parts =
-      jwt.split('.');
-
-    if (
-      parts.length !== 3
-    ) {
-      return {
-        valid: null,
-        signatureBytes:
-          null,
-      };
-    }
-
-    const [
-      headerSegment,
-      payloadSegment,
-      signatureSegment,
-    ] =
-      parts;
-
-    const publicBytes =
-      Buffer.from(
-        publicKeyBase64Url,
-        'base64url'
-      );
-
-    /*
-     * P-256 público não comprimido:
-     *
-     * 0x04
-     * + X (32 bytes)
-     * + Y (32 bytes)
-     *
-     * Total = 65 bytes.
-     */
-    if (
-      publicBytes.length !==
-        65 ||
-      publicBytes[0] !==
-        0x04
-    ) {
-      return {
-        valid: null,
-        signatureBytes:
-          null,
-      };
-    }
-
-    const x =
-      publicBytes
-        .subarray(
-          1,
-          33
-        )
-        .toString(
-          'base64url'
-        );
-
-    const y =
-      publicBytes
-        .subarray(
-          33,
-          65
-        )
-        .toString(
-          'base64url'
-        );
-
-    const key =
-      createPublicKey({
-        key: {
-          kty: 'EC',
-          crv: 'P-256',
-          x,
-          y,
-        } as any,
-
-        format: 'jwk',
-      });
-
-    const signature =
-      Buffer.from(
-        signatureSegment,
-        'base64url'
-      );
-
-    const signingInput =
-      Buffer.from(
-        `${headerSegment}.${payloadSegment}`,
-        'utf8'
-      );
-
-    /*
-     * JWT ES256 usa assinatura JOSE:
-     * R || S = 64 bytes.
-     */
-    const valid =
-      cryptoVerify(
-        'sha256',
-        signingInput,
-        {
-          key,
-          dsaEncoding:
-            'ieee-p1363',
-        },
-        signature
-      );
-
-    return {
-      valid,
-
-      signatureBytes:
-        signature.length,
-    };
-  } catch {
-    return {
-      valid: null,
-
-      signatureBytes:
-        null,
-    };
-  }
-}
-
-function buildVapidDebug(
-  webPush:
-    ReturnType<
-      typeof getWebPush
-    >,
-
-  subscription:
-    WebPushSubscription,
-
-  payload: string
-): VapidDebug {
-  const now =
-    Math.floor(
-      Date.now() /
-      1000
-    );
-
-  const empty:
-    VapidDebug =
-    {
-      serverNow:
-        new Date()
-          .toISOString(),
-
-      endpointOrigin:
-        null,
-
-      endpointHost:
-        null,
-
-      applePushEndpoint:
-        false,
-
-      authorizationScheme:
-        null,
-
-      jwtExtracted:
-        false,
-
-      jwtSegments:
-        0,
-
-      alg:
-        null,
-
-      typ:
-        null,
-
-      aud:
-        null,
-
-      audMatchesEndpointOrigin:
-        null,
-
-      subPreview:
-        null,
-
-      subValid:
-        null,
-
-      exp:
-        null,
-
-      expIso:
-        null,
-
-      expSecondsFromNow:
-        null,
-
-      expInFuture:
-        null,
-
-      expWithin24Hours:
-        null,
-
-      authorizationPublicKeyPresent:
-        false,
-
-      authorizationPublicKeyMatchesConfigured:
-        null,
-
-      configuredPublicKeyBytes:
-        null,
-
-      configuredPrivateKeyPresent:
-        Boolean(
-          cleanEnv(
-            process.env
-              .VAPID_PRIVATE_KEY
-          )
-        ),
-
-      signaturePresent:
-        false,
-
-      signatureBytes:
-        null,
-
-      signatureValidWithConfiguredPublicKey:
-        null,
-
-      debugError:
-        null,
-    };
-
-  try {
-    const endpointUrl =
-      new URL(
-        subscription.endpoint
-      );
-
-    empty.endpointOrigin =
-      endpointUrl.origin;
-
-    empty.endpointHost =
-      endpointUrl.hostname;
-
-    empty.applePushEndpoint =
-      endpointUrl.hostname ===
-        'web.push.apple.com' ||
-      endpointUrl.hostname
-        .endsWith(
-          '.push.apple.com'
-        );
-
-    /*
-     * O web-push usa exatamente esta função
-     * internamente antes de enviar.
-     *
-     * Nenhuma requisição é feita aqui.
-     */
-    const details =
-      webPush
-        .generateRequestDetails(
-          subscription,
-          payload,
-          {
-            TTL: 300,
-          }
-        );
-
-    const authorization =
-      getHeader(
-        details.headers,
-        'authorization'
-      );
-
-    const cryptoKey =
-      getHeader(
-        details.headers,
-        'crypto-key'
-      );
-
-    if (
-      authorization
-    ) {
-      empty.authorizationScheme =
-        authorization
-          .trim()
-          .split(/\s+/)[0] ??
-        null;
-    }
-
-    const jwt =
-      extractJwt(
-        authorization
-      );
-
-    const authPublicKey =
-      extractAuthorizationPublicKey(
-        authorization,
-        cryptoKey
-      );
-
-    const configuredPublicKey =
-      cleanEnv(
-        process.env
-          .NEXT_PUBLIC_VAPID_PUBLIC_KEY
-      );
-
-    if (
-      configuredPublicKey
-    ) {
-      try {
-        empty.configuredPublicKeyBytes =
-          Buffer.from(
-            configuredPublicKey,
-            'base64url'
-          ).length;
-      } catch {
-        empty.configuredPublicKeyBytes =
-          null;
-      }
-    }
-
-    empty.authorizationPublicKeyPresent =
-      Boolean(
-        authPublicKey
-      );
-
-    if (
-      authPublicKey &&
-      configuredPublicKey
-    ) {
-      empty.authorizationPublicKeyMatchesConfigured =
-        authPublicKey ===
-        configuredPublicKey;
-    }
-
-    if (!jwt) {
-      empty.debugError =
-        'Não foi possível extrair o JWT do Authorization header.';
-
-      return empty;
-    }
-
-    empty.jwtExtracted =
-      true;
-
-    const segments =
-      jwt.split('.');
-
-    empty.jwtSegments =
-      segments.length;
-
-    if (
-      segments.length !==
-        3
-    ) {
-      empty.debugError =
-        'JWT não possui 3 segmentos.';
-
-      return empty;
-    }
-
-    const header =
-      decodeJwtJson(
-        segments[0]
-      );
-
-    const claims =
-      decodeJwtJson(
-        segments[1]
-      );
-
-    empty.signaturePresent =
-      Boolean(
-        segments[2]
-      );
-
-    if (header) {
-      empty.alg =
-        typeof header.alg ===
-          'string'
-          ? header.alg
-          : null;
-
-      empty.typ =
-        typeof header.typ ===
-          'string'
-          ? header.typ
-          : null;
-    }
-
-    if (claims) {
-      empty.aud =
-        typeof claims.aud ===
-          'string'
-          ? claims.aud
-          : null;
-
-      if (
-        empty.aud &&
-        empty.endpointOrigin
-      ) {
-        empty.audMatchesEndpointOrigin =
-          empty.aud ===
-          empty.endpointOrigin;
-      }
-
-      empty.subPreview =
-        maskSubject(
-          claims.sub
-        );
-
-      empty.subValid =
-        subjectIsValid(
-          claims.sub
-        );
-
-      const exp =
-        typeof claims.exp ===
-          'number'
-          ? claims.exp
-          : Number(
-              claims.exp
-            );
-
-      if (
-        Number.isFinite(
-          exp
-        )
-      ) {
-        empty.exp =
-          exp;
-
-        empty.expSecondsFromNow =
-          exp - now;
-
-        empty.expInFuture =
-          exp > now;
-
-        empty.expWithin24Hours =
-          exp > now &&
-          exp - now <=
-            86400;
-
-        try {
-          empty.expIso =
-            new Date(
-              exp *
-              1000
-            ).toISOString();
-        } catch {
-          empty.expIso =
-            null;
-        }
-      }
-    }
-
-    if (
-      configuredPublicKey
-    ) {
-      const verification =
-        verifyJwtSignature(
-          jwt,
-          configuredPublicKey
-        );
-
-      empty.signatureValidWithConfiguredPublicKey =
-        verification.valid;
-
-      empty.signatureBytes =
-        verification.signatureBytes;
-    }
-
-    return empty;
-  } catch (error) {
-    empty.debugError =
-      safeError(
-        error
-      );
-
-    return empty;
-  }
-}
-
-/* =========================================================
-   DEVICE
-========================================================= */
-
 function getDevice(
-  job:
-    ReminderJobRow
+  job: ReminderJobRow
 ): PushDeviceRow | null {
-  if (
-    Array.isArray(
-      job.push_devices
-    )
-  ) {
-    return (
-      job
-        .push_devices[0] ??
-      null
-    );
+  if (Array.isArray(job.push_devices)) {
+    return job.push_devices[0] ?? null;
   }
 
-  return (
-    job.push_devices ??
-    null
-  );
+  return job.push_devices ?? null;
 }
-
-/* =========================================================
-   QUIET HOURS
-========================================================= */
 
 function validTime(
   value: unknown
 ): value is string {
   if (
-    typeof value !==
-      'string' ||
-    !/^\d{2}:\d{2}$/.test(
-      value
-    )
+    typeof value !== 'string' ||
+    !/^\d{2}:\d{2}$/.test(value)
   ) {
     return false;
   }
 
-  const [
-    hour,
-    minute,
-  ] =
-    value
-      .split(':')
-      .map(Number);
+  const [hour, minute] =
+    value.split(':').map(Number);
 
   return (
-    Number.isInteger(
-      hour
-    ) &&
-    Number.isInteger(
-      minute
-    ) &&
+    Number.isInteger(hour) &&
+    Number.isInteger(minute) &&
     hour >= 0 &&
     hour <= 23 &&
     minute >= 0 &&
@@ -1428,60 +330,35 @@ function isInQuietHours(
   }
 
   const current =
-    localNow.getHours() *
-      60 +
+    localNow.getHours() * 60 +
     localNow.getMinutes();
 
-  const [
-    startHour,
-    startMinute,
-  ] =
-    start
-      .split(':')
-      .map(Number);
+  const [startHour, startMinute] =
+    start.split(':').map(Number);
 
-  const [
-    endHour,
-    endMinute,
-  ] =
-    end
-      .split(':')
-      .map(Number);
+  const [endHour, endMinute] =
+    end.split(':').map(Number);
 
   const startMinutes =
-    startHour *
-      60 +
-    startMinute;
+    startHour * 60 + startMinute;
 
   const endMinutes =
-    endHour *
-      60 +
-    endMinute;
+    endHour * 60 + endMinute;
 
-  if (
-    startMinutes ===
-      endMinutes
-  ) {
+  if (startMinutes === endMinutes) {
     return false;
   }
 
-  if (
-    startMinutes <
-      endMinutes
-  ) {
+  if (startMinutes < endMinutes) {
     return (
-      current >=
-        startMinutes &&
-      current <
-        endMinutes
+      current >= startMinutes &&
+      current < endMinutes
     );
   }
 
   return (
-    current >=
-      startMinutes ||
-    current <
-      endMinutes
+    current >= startMinutes ||
+    current < endMinutes
   );
 }
 
@@ -1497,41 +374,24 @@ function quietEndUtc(
       timezone
     );
 
-  const [
-    startHour,
-    startMinute,
-  ] =
-    start
-      .split(':')
-      .map(Number);
+  const [startHour, startMinute] =
+    start.split(':').map(Number);
 
-  const [
-    endHour,
-    endMinute,
-  ] =
-    end
-      .split(':')
-      .map(Number);
+  const [endHour, endMinute] =
+    end.split(':').map(Number);
 
   const startMinutes =
-    startHour *
-      60 +
-    startMinute;
+    startHour * 60 + startMinute;
 
   const endMinutes =
-    endHour *
-      60 +
-    endMinute;
+    endHour * 60 + endMinute;
 
   const current =
-    localNow.getHours() *
-      60 +
+    localNow.getHours() * 60 +
     localNow.getMinutes();
 
   const target =
-    new Date(
-      localNow
-    );
+    new Date(localNow);
 
   target.setHours(
     endHour,
@@ -1541,14 +401,11 @@ function quietEndUtc(
   );
 
   if (
-    startMinutes >
-      endMinutes &&
-    current >=
-      startMinutes
+    startMinutes > endMinutes &&
+    current >= startMinutes
   ) {
     target.setDate(
-      target.getDate() +
-        1
+      target.getDate() + 1
     );
   }
 
@@ -1558,18 +415,509 @@ function quietEndUtc(
   );
 }
 
-/* =========================================================
-   CRON
-========================================================= */
+function getHeader(
+  headers: unknown,
+  wanted: string
+): string | null {
+  if (
+    typeof headers !== 'object' ||
+    headers === null
+  ) {
+    return null;
+  }
+
+  const record =
+    headers as Record<
+      string,
+      unknown
+    >;
+
+  const key =
+    Object.keys(record).find(
+      (name) =>
+        name.toLowerCase() ===
+        wanted.toLowerCase()
+    );
+
+  if (!key) {
+    return null;
+  }
+
+  const value =
+    record[key];
+
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (
+    value === undefined ||
+    value === null
+  ) {
+    return null;
+  }
+
+  return String(value);
+}
+
+function extractJwt(
+  authorization: string | null
+): string | null {
+  if (!authorization) {
+    return null;
+  }
+
+  const modern =
+    authorization.match(
+      /(?:^|\s|,)t=([^,\s]+)/i
+    );
+
+  if (
+    modern &&
+    modern[1]
+  ) {
+    return modern[1];
+  }
+
+  const parts =
+    authorization
+      .trim()
+      .split(/\s+/);
+
+  if (
+    parts.length >= 2 &&
+    parts[1] &&
+    parts[1]
+      .split('.')
+      .length === 3
+  ) {
+    return parts[1];
+  }
+
+  return null;
+}
+
+function extractAuthPublicKey(
+  authorization: string | null,
+  cryptoKey: string | null
+): string | null {
+  if (authorization) {
+    const match =
+      authorization.match(
+        /(?:^|\s|,)k=([^,\s]+)/i
+      );
+
+    if (
+      match &&
+      match[1]
+    ) {
+      return match[1];
+    }
+  }
+
+  if (cryptoKey) {
+    const match =
+      cryptoKey.match(
+        /(?:^|;)\s*p256ecdsa=([^;,\s]+)/i
+      );
+
+    if (
+      match &&
+      match[1]
+    ) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+function decodeJwtObject(
+  segment: string
+): Record<string, unknown> | null {
+  try {
+    const text =
+      Buffer.from(
+        segment,
+        'base64url'
+      ).toString('utf8');
+
+    const parsed: unknown =
+      JSON.parse(text);
+
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null
+    ) {
+      return null;
+    }
+
+    return parsed as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    return null;
+  }
+}
+
+function subjectIsValid(
+  value: unknown
+): boolean {
+  if (
+    typeof value !== 'string' ||
+    !value.trim()
+  ) {
+    return false;
+  }
+
+  const subject =
+    value.trim();
+
+  if (
+    subject.startsWith(
+      'mailto:'
+    )
+  ) {
+    const email =
+      subject.slice(7);
+
+    return (
+      email.includes('@') &&
+      !email
+        .toLowerCase()
+        .endsWith(
+          '@localhost'
+        )
+    );
+  }
+
+  try {
+    const url =
+      new URL(subject);
+
+    return (
+      url.protocol === 'https:' &&
+      url.hostname !== 'localhost'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function maskSubject(
+  value: unknown
+): string | null {
+  if (
+    typeof value !== 'string'
+  ) {
+    return null;
+  }
+
+  const subject =
+    value.trim();
+
+  if (
+    !subject.startsWith(
+      'mailto:'
+    )
+  ) {
+    return subject || null;
+  }
+
+  const email =
+    subject.slice(7);
+
+  const at =
+    email.indexOf('@');
+
+  if (at <= 0) {
+    return 'mailto:***';
+  }
+
+  const name =
+    email.slice(
+      0,
+      at
+    );
+
+  const domain =
+    email.slice(
+      at + 1
+    );
+
+  return `mailto:${name.slice(
+    0,
+    1
+  )}***@${domain}`;
+}
+
+function buildVapidDebug(
+  webPush: ReturnType<
+    typeof getWebPush
+  >,
+  subscription: WebPushSubscription,
+  payload: string
+): VapidDebug {
+  const debug: VapidDebug = {
+    endpointOrigin: null,
+    endpointHost: null,
+    applePushEndpoint: false,
+    authorizationScheme: null,
+    jwtExtracted: false,
+    jwtSegments: 0,
+    alg: null,
+    typ: null,
+    aud: null,
+    audMatchesEndpointOrigin: null,
+    subPreview: null,
+    subValid: null,
+    exp: null,
+    expIso: null,
+    expSecondsFromNow: null,
+    expInFuture: null,
+    expWithin24Hours: null,
+    authorizationPublicKeyPresent: false,
+    authorizationPublicKeyMatchesConfigured:
+      null,
+    configuredPublicKeyBytes: null,
+    configuredPrivateKeyPresent:
+      Boolean(
+        cleanEnv(
+          process.env
+            .VAPID_PRIVATE_KEY
+        )
+      ),
+    pairValidatedByPushServer:
+      true,
+    debugError: null,
+  };
+
+  try {
+    const endpointUrl =
+      new URL(
+        subscription.endpoint
+      );
+
+    debug.endpointOrigin =
+      endpointUrl.origin;
+
+    debug.endpointHost =
+      endpointUrl.hostname;
+
+    debug.applePushEndpoint =
+      endpointUrl.hostname ===
+        'web.push.apple.com' ||
+      endpointUrl.hostname.endsWith(
+        '.push.apple.com'
+      );
+
+    const details =
+      webPush.generateRequestDetails(
+        subscription,
+        payload,
+        {
+          TTL: 300,
+        }
+      );
+
+    const authorization =
+      getHeader(
+        details.headers,
+        'authorization'
+      );
+
+    const cryptoKey =
+      getHeader(
+        details.headers,
+        'crypto-key'
+      );
+
+    if (authorization) {
+      const parts =
+        authorization
+          .trim()
+          .split(/\s+/);
+
+      debug.authorizationScheme =
+        parts[0] ?? null;
+    }
+
+    const authPublicKey =
+      extractAuthPublicKey(
+        authorization,
+        cryptoKey
+      );
+
+    const configuredPublicKey =
+      cleanEnv(
+        process.env
+          .NEXT_PUBLIC_VAPID_PUBLIC_KEY
+      );
+
+    debug.authorizationPublicKeyPresent =
+      Boolean(
+        authPublicKey
+      );
+
+    if (configuredPublicKey) {
+      try {
+        debug.configuredPublicKeyBytes =
+          Buffer.from(
+            configuredPublicKey,
+            'base64url'
+          ).length;
+      } catch {
+        debug.configuredPublicKeyBytes =
+          null;
+      }
+    }
+
+    if (
+      authPublicKey &&
+      configuredPublicKey
+    ) {
+      debug.authorizationPublicKeyMatchesConfigured =
+        authPublicKey ===
+        configuredPublicKey;
+    }
+
+    const jwt =
+      extractJwt(
+        authorization
+      );
+
+    if (!jwt) {
+      debug.debugError =
+        'Não foi possível extrair o JWT do header Authorization.';
+
+      return debug;
+    }
+
+    debug.jwtExtracted =
+      true;
+
+    const segments =
+      jwt.split('.');
+
+    debug.jwtSegments =
+      segments.length;
+
+    if (
+      segments.length !== 3
+    ) {
+      debug.debugError =
+        'JWT VAPID não possui 3 segmentos.';
+
+      return debug;
+    }
+
+    const header =
+      decodeJwtObject(
+        segments[0]
+      );
+
+    const claims =
+      decodeJwtObject(
+        segments[1]
+      );
+
+    if (header) {
+      debug.alg =
+        typeof header.alg ===
+          'string'
+          ? header.alg
+          : null;
+
+      debug.typ =
+        typeof header.typ ===
+          'string'
+          ? header.typ
+          : null;
+    }
+
+    if (claims) {
+      debug.aud =
+        typeof claims.aud ===
+          'string'
+          ? claims.aud
+          : null;
+
+      if (
+        debug.aud &&
+        debug.endpointOrigin
+      ) {
+        debug.audMatchesEndpointOrigin =
+          debug.aud ===
+          debug.endpointOrigin;
+      }
+
+      debug.subPreview =
+        maskSubject(
+          claims.sub
+        );
+
+      debug.subValid =
+        subjectIsValid(
+          claims.sub
+        );
+
+      const exp =
+        typeof claims.exp ===
+          'number'
+          ? claims.exp
+          : Number(
+              claims.exp
+            );
+
+      if (
+        Number.isFinite(exp)
+      ) {
+        const nowSeconds =
+          Math.floor(
+            Date.now() /
+              1000
+          );
+
+        debug.exp =
+          exp;
+
+        debug.expSecondsFromNow =
+          exp - nowSeconds;
+
+        debug.expInFuture =
+          exp >
+          nowSeconds;
+
+        debug.expWithin24Hours =
+          exp >
+            nowSeconds &&
+          exp -
+            nowSeconds <=
+            86400;
+
+        debug.expIso =
+          new Date(
+            exp * 1000
+          ).toISOString();
+      }
+    }
+
+    return debug;
+  } catch (error) {
+    debug.debugError =
+      safeError(
+        error
+      );
+
+    return debug;
+  }
+}
 
 export async function GET(
   request: Request
 ) {
   try {
-    /* =====================================================
-       1. AUTORIZAÇÃO
-    ===================================================== */
-
     const cronSecret =
       cleanEnv(
         process.env
@@ -1580,13 +928,10 @@ export async function GET(
       return reply(
         {
           ok: false,
-
           version:
             CRON_VERSION,
-
           stage:
             'cron-configuration',
-
           error:
             'CRON_SECRET não configurado.',
         },
@@ -1603,23 +948,16 @@ export async function GET(
       return reply(
         {
           ok: false,
-
           version:
             CRON_VERSION,
-
           stage:
             'authorization',
-
           error:
             'Unauthorized',
         },
         401
       );
     }
-
-    /* =====================================================
-       2. SUPABASE
-    ===================================================== */
 
     const supabaseUrl =
       cleanEnv(
@@ -1640,13 +978,10 @@ export async function GET(
       return reply(
         {
           ok: false,
-
           version:
             CRON_VERSION,
-
           stage:
             'supabase-configuration',
-
           error:
             'SUPABASE_URL ou SUPABASE_SECRET_KEY não configurada.',
         },
@@ -1662,24 +997,17 @@ export async function GET(
           auth: {
             persistSession:
               false,
-
             autoRefreshToken:
               false,
-
             detectSessionInUrl:
               false,
           },
         }
       );
 
-    /* =====================================================
-       3. CONTAR DEVICES
-    ===================================================== */
-
     const {
       count:
         deviceCount,
-
       error:
         deviceError,
     } =
@@ -1692,7 +1020,6 @@ export async function GET(
           {
             count:
               'exact',
-
             head:
               true,
           }
@@ -1702,29 +1029,20 @@ export async function GET(
       return reply(
         {
           ok: false,
-
           version:
             CRON_VERSION,
-
           stage:
             'supabase-connection',
-
           error:
             'Falha ao acessar push_devices.',
-
           code:
             deviceError.code,
-
           detail:
             deviceError.message,
         },
         500
       );
     }
-
-    /* =====================================================
-       4. WEB PUSH
-    ===================================================== */
 
     let webPush:
       ReturnType<
@@ -1738,16 +1056,12 @@ export async function GET(
       return reply(
         {
           ok: false,
-
           version:
             CRON_VERSION,
-
           stage:
             'vapid',
-
           error:
             'Falha ao configurar VAPID.',
-
           detail:
             safeError(
               error
@@ -1757,18 +1071,9 @@ export async function GET(
       );
     }
 
-    /* =====================================================
-       5. JOBS VENCIDOS
-    ===================================================== */
-
-    const nowIso =
-      new Date()
-        .toISOString();
-
     const {
       data:
         rawJobs,
-
       error:
         jobsError,
     } =
@@ -1778,32 +1083,31 @@ export async function GET(
         )
         .select(
           `
-            device_id,
-            occurrence_id,
-            medication_id,
-            medication_label,
-            scheduled_at,
-            deadline_at,
-            next_notify_at,
-            repeat_minutes,
-            phase,
-            sound,
-            vibration,
-            required,
-            url,
-            active,
-            last_sent_at,
-            locked_until,
-
-            push_devices!inner (
-              subscription,
-              timezone,
-              quiet_enabled,
-              quiet_start,
-              quiet_end,
-              active
-            )
-          `
+          device_id,
+          occurrence_id,
+          medication_id,
+          medication_label,
+          scheduled_at,
+          deadline_at,
+          next_notify_at,
+          repeat_minutes,
+          phase,
+          sound,
+          vibration,
+          required,
+          url,
+          active,
+          last_sent_at,
+          locked_until,
+          push_devices!inner (
+            subscription,
+            timezone,
+            quiet_enabled,
+            quiet_start,
+            quiet_end,
+            active
+          )
+        `
         )
         .eq(
           'active',
@@ -1815,7 +1119,8 @@ export async function GET(
         )
         .lte(
           'next_notify_at',
-          nowIso
+          new Date()
+            .toISOString()
         )
         .order(
           'next_notify_at',
@@ -1830,19 +1135,14 @@ export async function GET(
       return reply(
         {
           ok: false,
-
           version:
             CRON_VERSION,
-
           stage:
             'reminder-query',
-
           error:
             'Falha ao consultar reminder_jobs.',
-
           code:
             jobsError.code,
-
           detail:
             jobsError.message,
         },
@@ -1857,10 +1157,6 @@ export async function GET(
       ) as unknown as
         ReminderJobRow[];
 
-    /* =====================================================
-       6. CONTADORES
-    ===================================================== */
-
     const selected =
       jobs.length;
 
@@ -1871,23 +1167,17 @@ export async function GET(
     let quiet = 0;
     let expired = 0;
 
-    let lastPushError:
-      PushErrorDiagnostic |
-      null =
+    let lastVapidDebug:
+      VapidDebug | null =
       null;
 
-    let lastVapidDebug:
-      VapidDebug |
-      null =
+    let lastPushError:
+      PushErrorDiagnostic | null =
       null;
 
     const pushErrors:
       PushErrorDiagnostic[] =
       [];
-
-    /* =====================================================
-       7. PROCESSAR
-    ===================================================== */
 
     for (
       const job of jobs
@@ -1895,37 +1185,30 @@ export async function GET(
       const iterationNow =
         new Date();
 
-      /* ===================================================
-         LOCK
-      =================================================== */
-
       if (
         job.locked_until
       ) {
-        const lock =
+        const lockDate =
           new Date(
             job.locked_until
           );
 
         if (
           Number.isFinite(
-            lock.getTime()
+            lockDate.getTime()
           ) &&
-          lock.getTime() >
-            iterationNow
-              .getTime()
+          lockDate.getTime() >
+            iterationNow.getTime()
         ) {
           skippedLocked++;
-
           continue;
         }
       }
 
       const lockUntil =
         new Date(
-          iterationNow
-            .getTime() +
-          2 * 60_000
+          iterationNow.getTime() +
+            2 * 60_000
         ).toISOString();
 
       let claimQuery =
@@ -1936,7 +1219,6 @@ export async function GET(
           .update({
             locked_until:
               lockUntil,
-
             updated_at:
               iterationNow
                 .toISOString(),
@@ -1973,7 +1255,6 @@ export async function GET(
       const {
         data:
           claimedRows,
-
         error:
           claimError,
       } =
@@ -1984,7 +1265,6 @@ export async function GET(
 
       if (claimError) {
         failed++;
-
         continue;
       }
 
@@ -1994,15 +1274,10 @@ export async function GET(
           0
       ) {
         skippedLocked++;
-
         continue;
       }
 
       claimed++;
-
-      /* ===================================================
-         DEVICE
-      =================================================== */
 
       const device =
         getDevice(job);
@@ -2017,7 +1292,8 @@ export async function GET(
             'reminder_jobs'
           )
           .update({
-            active: false,
+            active:
+              false,
             locked_until:
               null,
             updated_at:
@@ -2043,10 +1319,6 @@ export async function GET(
           ? device.timezone
           : 'UTC';
 
-      /* ===================================================
-         QUIET HOURS
-      =================================================== */
-
       if (
         device.quiet_enabled ===
           true &&
@@ -2071,7 +1343,7 @@ export async function GET(
               device.quiet_end
             )
           ) {
-            const next =
+            const resumeAt =
               quietEndUtc(
                 iterationNow,
                 timezone,
@@ -2085,12 +1357,10 @@ export async function GET(
               )
               .update({
                 next_notify_at:
-                  next
+                  resumeAt
                     .toISOString(),
-
                 locked_until:
                   null,
-
                 updated_at:
                   new Date()
                     .toISOString(),
@@ -2105,18 +1375,13 @@ export async function GET(
               );
 
             quiet++;
-
             continue;
           }
         } catch {
-          // Se timezone estiver inválido,
-          // continua o envio normalmente.
+          // Timezone inválido:
+          // segue o envio normalmente.
         }
       }
-
-      /* ===================================================
-         PAYLOAD
-      =================================================== */
 
       const deadline =
         job.deadline_at
@@ -2158,8 +1423,7 @@ export async function GET(
             `med-${job.occurrence_id}`,
 
           url:
-            job.url ||
-            '/',
+            job.url || '/',
 
           occurrenceId:
             job.occurrence_id,
@@ -2181,21 +1445,12 @@ export async function GET(
             overdue,
         });
 
-      /* ===================================================
-         PUSH
-      =================================================== */
-
       try {
         const subscription =
           parseSubscription(
             device.subscription
           );
 
-        /*
-         * GERAR DIAGNÓSTICO ANTES DO ENVIO.
-         *
-         * Isso NÃO envia nenhuma notificação.
-         */
         lastVapidDebug =
           buildVapidDebug(
             webPush,
@@ -2214,10 +1469,6 @@ export async function GET(
 
         sent++;
 
-        /* =================================================
-           REMÉDIO NÃO OBRIGATÓRIO
-        ================================================= */
-
         if (
           job.phase ===
             'main' &&
@@ -2229,18 +1480,15 @@ export async function GET(
               'reminder_jobs'
             )
             .update({
-              active: false,
-
+              active:
+                false,
               phase:
                 'done',
-
               last_sent_at:
                 new Date()
                   .toISOString(),
-
               locked_until:
                 null,
-
               updated_at:
                 new Date()
                   .toISOString(),
@@ -2256,10 +1504,6 @@ export async function GET(
 
           continue;
         }
-
-        /* =================================================
-           IR PARA DEADLINE
-        ================================================= */
 
         if (
           job.phase ===
@@ -2279,17 +1523,13 @@ export async function GET(
               next_notify_at:
                 deadline
                   .toISOString(),
-
               phase:
                 'deadline',
-
               last_sent_at:
                 new Date()
                   .toISOString(),
-
               locked_until:
                 null,
-
               updated_at:
                 new Date()
                   .toISOString(),
@@ -2305,10 +1545,6 @@ export async function GET(
 
           continue;
         }
-
-        /* =================================================
-           REPETIR
-        ================================================= */
 
         const configured =
           Number(
@@ -2328,11 +1564,11 @@ export async function GET(
             ? configured
             : 30;
 
-        const next =
+        const nextNotifyAt =
           new Date(
             Date.now() +
-            repeatMinutes *
-              60_000
+              repeatMinutes *
+                60_000
           );
 
         await supabase
@@ -2341,19 +1577,15 @@ export async function GET(
           )
           .update({
             next_notify_at:
-              next
+              nextNotifyAt
                 .toISOString(),
-
             phase:
               'repeat',
-
             last_sent_at:
               new Date()
                 .toISOString(),
-
             locked_until:
               null,
-
             updated_at:
               new Date()
                 .toISOString(),
@@ -2425,13 +1657,11 @@ export async function GET(
           diagnostic
         );
 
-        /* =================================================
-           SUBSCRIPTION EXPIRADA
-        ================================================= */
-
         if (
-          statusCode === 404 ||
-          statusCode === 410
+          statusCode ===
+            404 ||
+          statusCode ===
+            410
         ) {
           expired++;
 
@@ -2440,8 +1670,8 @@ export async function GET(
               'push_devices'
             )
             .update({
-              active: false,
-
+              active:
+                false,
               updated_at:
                 new Date()
                   .toISOString(),
@@ -2456,11 +1686,10 @@ export async function GET(
               'reminder_jobs'
             )
             .update({
-              active: false,
-
+              active:
+                false,
               locked_until:
                 null,
-
               updated_at:
                 new Date()
                   .toISOString(),
@@ -2473,14 +1702,10 @@ export async function GET(
           continue;
         }
 
-        /* =================================================
-           RETRY EM 5 MINUTOS
-        ================================================= */
-
-        const retry =
+        const retryAt =
           new Date(
             Date.now() +
-            5 * 60_000
+              5 * 60_000
           );
 
         await supabase
@@ -2489,12 +1714,10 @@ export async function GET(
           )
           .update({
             next_notify_at:
-              retry
+              retryAt
                 .toISOString(),
-
             locked_until:
               null,
-
             updated_at:
               new Date()
                 .toISOString(),
@@ -2509,10 +1732,6 @@ export async function GET(
           );
       }
     }
-
-    /* =====================================================
-       RESULTADO
-    ===================================================== */
 
     return reply({
       ok: true,
@@ -2530,8 +1749,7 @@ export async function GET(
         'configured',
 
       pushDevices:
-        deviceCount ??
-        0,
+        deviceCount ?? 0,
 
       selected,
 
@@ -2543,12 +1761,6 @@ export async function GET(
 
       failed,
 
-      /*
-       * NOVO:
-       *
-       * Mostra os claims e validações
-       * do último JWT VAPID gerado.
-       */
       vapidDebug:
         lastVapidDebug,
 
