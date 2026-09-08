@@ -5,6 +5,11 @@ import type {
 } from 'web-push';
 
 import {
+  createPublicKey,
+  verify as cryptoVerify,
+} from 'node:crypto';
+
+import {
   fromZonedTime,
   toZonedTime,
 } from 'date-fns-tz';
@@ -18,7 +23,7 @@ export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 const CRON_VERSION =
-  'SUPABASE_CRON_V2_PUSH_DEBUG';
+  'SUPABASE_CRON_V3_VAPID_DEBUG';
 
 /* =========================================================
    TIPOS
@@ -101,6 +106,96 @@ type ReminderJobRow = {
     | null;
 };
 
+type VapidDebug = {
+  serverNow: string;
+
+  endpointOrigin:
+    | string
+    | null;
+
+  endpointHost:
+    | string
+    | null;
+
+  applePushEndpoint:
+    boolean;
+
+  authorizationScheme:
+    | string
+    | null;
+
+  jwtExtracted:
+    boolean;
+
+  jwtSegments:
+    number;
+
+  alg:
+    | string
+    | null;
+
+  typ:
+    | string
+    | null;
+
+  aud:
+    | string
+    | null;
+
+  audMatchesEndpointOrigin:
+    boolean | null;
+
+  subPreview:
+    | string
+    | null;
+
+  subValid:
+    boolean | null;
+
+  exp:
+    | number
+    | null;
+
+  expIso:
+    | string
+    | null;
+
+  expSecondsFromNow:
+    | number
+    | null;
+
+  expInFuture:
+    boolean | null;
+
+  expWithin24Hours:
+    boolean | null;
+
+  authorizationPublicKeyPresent:
+    boolean;
+
+  authorizationPublicKeyMatchesConfigured:
+    boolean | null;
+
+  configuredPublicKeyBytes:
+    number | null;
+
+  configuredPrivateKeyPresent:
+    boolean;
+
+  signaturePresent:
+    boolean;
+
+  signatureBytes:
+    number | null;
+
+  signatureValidWithConfiguredPublicKey:
+    boolean | null;
+
+  debugError:
+    | string
+    | null;
+};
+
 type PushErrorDiagnostic = {
   occurrenceId: string;
 
@@ -117,6 +212,9 @@ type PushErrorDiagnostic = {
     | null;
 
   body: unknown;
+
+  vapidDebug:
+    VapidDebug | null;
 };
 
 /* =========================================================
@@ -148,8 +246,39 @@ function reply(
 }
 
 /* =========================================================
-   ERROS
+   HELPERS
 ========================================================= */
+
+function cleanEnv(
+  value:
+    | string
+    | undefined
+): string {
+  if (!value) {
+    return '';
+  }
+
+  let result =
+    value.trim();
+
+  if (
+    (
+      result.startsWith('"') &&
+      result.endsWith('"')
+    ) ||
+    (
+      result.startsWith("'") &&
+      result.endsWith("'")
+    )
+  ) {
+    result =
+      result
+        .slice(1, -1)
+        .trim();
+  }
+
+  return result;
+}
 
 function safeError(
   error: unknown
@@ -163,7 +292,7 @@ function safeError(
       error.message;
   } else if (
     typeof error ===
-    'string'
+      'string'
   ) {
     message =
       error;
@@ -175,9 +304,7 @@ function safeError(
         );
     } catch {
       message =
-        String(
-          error
-        );
+        String(error);
     }
   }
 
@@ -193,7 +320,7 @@ function safeError(
 }
 
 /* =========================================================
-   STATUS HTTP DO WEB PUSH
+   ERRO WEB PUSH
 ========================================================= */
 
 function getPushStatusCode(
@@ -224,22 +351,6 @@ function getPushStatusCode(
     : null;
 }
 
-/* =========================================================
-   BODY DO ERRO WEB PUSH
-
-   A Apple normalmente devolve algo como:
-
-   {
-     "reason": "VapidPkHashMismatch"
-   }
-
-   ou
-
-   {
-     "reason": "BadJwtToken"
-   }
-========================================================= */
-
 function getPushErrorBody(
   error: unknown
 ): unknown {
@@ -266,46 +377,35 @@ function getPushErrorBody(
     return null;
   }
 
-  /*
-   * web-push normalmente
-   * devolve body como string.
-   */
   if (
     typeof body ===
-    'string'
+      'string'
   ) {
-    const trimmed =
+    const text =
       body.trim();
 
-    if (!trimmed) {
+    if (!text) {
       return null;
     }
 
     try {
       return JSON.parse(
-        trimmed
+        text
       );
     } catch {
-      return trimmed;
+      return text;
     }
   }
 
-  /*
-   * Também aceita Buffer /
-   * Uint8Array caso a biblioteca
-   * devolva bytes.
-   */
   if (
     body instanceof
-    Uint8Array
+      Uint8Array
   ) {
     try {
       const text =
         Buffer
           .from(body)
-          .toString(
-            'utf8'
-          )
+          .toString('utf8')
           .trim();
 
       if (!text) {
@@ -326,10 +426,6 @@ function getPushErrorBody(
 
   return body;
 }
-
-/* =========================================================
-   EXTRAIR "reason"
-========================================================= */
 
 function getPushErrorReason(
   body: unknown
@@ -354,10 +450,6 @@ function getPushErrorReason(
     }
   }
 
-  /*
-   * Caso o body tenha vindo
-   * como texto.
-   */
   if (
     typeof body ===
       'string'
@@ -476,11 +568,795 @@ function parseSubscription(
 }
 
 /* =========================================================
-   DEVICE DO JOIN
+   VAPID DEBUG
+========================================================= */
+
+function getHeader(
+  headers: unknown,
+  wantedName: string
+): string | null {
+  if (
+    typeof headers !==
+      'object' ||
+    headers === null
+  ) {
+    return null;
+  }
+
+  const record =
+    headers as Record<
+      string,
+      unknown
+    >;
+
+  const foundKey =
+    Object.keys(record)
+      .find(
+        key =>
+          key.toLowerCase() ===
+          wantedName
+            .toLowerCase()
+      );
+
+  if (!foundKey) {
+    return null;
+  }
+
+  const value =
+    record[foundKey];
+
+  return typeof value ===
+    'string'
+    ? value
+    : value ===
+        undefined ||
+      value === null
+      ? null
+      : String(value);
+}
+
+function extractJwt(
+  authorization:
+    | string
+    | null
+): string | null {
+  if (!authorization) {
+    return null;
+  }
+
+  /*
+   * Formato moderno:
+   *
+   * Authorization:
+   * vapid t=JWT,k=PUBLIC_KEY
+   */
+  const vapidToken =
+    authorization.match(
+      /(?:^|\s|,)t=([^,\s]+)/i
+    );
+
+  if (
+    vapidToken?.[1]
+  ) {
+    return vapidToken[1];
+  }
+
+  /*
+   * Formato antigo:
+   *
+   * Authorization:
+   * WebPush JWT
+   */
+  const parts =
+    authorization
+      .trim()
+      .split(/\s+/);
+
+  if (
+    parts.length >= 2 &&
+    parts[1]
+      .split('.')
+      .length === 3
+  ) {
+    return parts[1];
+  }
+
+  return null;
+}
+
+function extractAuthorizationPublicKey(
+  authorization:
+    | string
+    | null,
+
+  cryptoKey:
+    | string
+    | null
+): string | null {
+  if (
+    authorization
+  ) {
+    const match =
+      authorization.match(
+        /(?:^|\s|,)k=([^,\s]+)/i
+      );
+
+    if (
+      match?.[1]
+    ) {
+      return match[1];
+    }
+  }
+
+  /*
+   * Compatibilidade com
+   * versões antigas.
+   */
+  if (cryptoKey) {
+    const match =
+      cryptoKey.match(
+        /(?:^|;)\s*p256ecdsa=([^;,\s]+)/i
+      );
+
+    if (
+      match?.[1]
+    ) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+function decodeJwtJson(
+  segment: string
+): Record<
+  string,
+  unknown
+> | null {
+  try {
+    const text =
+      Buffer
+        .from(
+          segment,
+          'base64url'
+        )
+        .toString(
+          'utf8'
+        );
+
+    const parsed =
+      JSON.parse(
+        text
+      );
+
+    return (
+      typeof parsed ===
+        'object' &&
+      parsed !== null
+    )
+      ? parsed
+          as Record<
+            string,
+            unknown
+          >
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function subjectIsValid(
+  value: unknown
+): boolean {
+  if (
+    typeof value !==
+      'string' ||
+    !value.trim()
+  ) {
+    return false;
+  }
+
+  const subject =
+    value.trim();
+
+  if (
+    subject.startsWith(
+      'mailto:'
+    )
+  ) {
+    const email =
+      subject.slice(
+        'mailto:'.length
+      );
+
+    return (
+      email.includes('@') &&
+      !email
+        .toLowerCase()
+        .endsWith(
+          '@localhost'
+        )
+    );
+  }
+
+  try {
+    const url =
+      new URL(subject);
+
+    return (
+      url.protocol ===
+        'https:' &&
+      url.hostname !==
+        'localhost'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function maskSubject(
+  value: unknown
+): string | null {
+  if (
+    typeof value !==
+      'string'
+  ) {
+    return null;
+  }
+
+  const subject =
+    value.trim();
+
+  if (
+    subject.startsWith(
+      'mailto:'
+    )
+  ) {
+    const email =
+      subject.slice(
+        7
+      );
+
+    const at =
+      email.indexOf('@');
+
+    if (at > 0) {
+      const name =
+        email.slice(
+          0,
+          at
+        );
+
+      const domain =
+        email.slice(
+          at + 1
+        );
+
+      const masked =
+        name.length <= 1
+          ? '*'
+          : `${name[0]}***`;
+
+      return (
+        `mailto:${masked}@${domain}`
+      );
+    }
+  }
+
+  /*
+   * URL pública não é segredo.
+   */
+  return subject;
+}
+
+/* =========================================================
+   VERIFICAR ASSINATURA JWT
+
+   Confirma matematicamente se o JWT foi assinado
+   por uma chave privada correspondente à chave
+   pública configurada na Vercel.
+========================================================= */
+
+function verifyJwtSignature(
+  jwt: string,
+  publicKeyBase64Url: string
+): {
+  valid:
+    boolean | null;
+
+  signatureBytes:
+    number | null;
+} {
+  try {
+    const parts =
+      jwt.split('.');
+
+    if (
+      parts.length !== 3
+    ) {
+      return {
+        valid: null,
+        signatureBytes:
+          null,
+      };
+    }
+
+    const [
+      headerSegment,
+      payloadSegment,
+      signatureSegment,
+    ] =
+      parts;
+
+    const publicBytes =
+      Buffer.from(
+        publicKeyBase64Url,
+        'base64url'
+      );
+
+    /*
+     * P-256 público não comprimido:
+     *
+     * 0x04
+     * + X (32 bytes)
+     * + Y (32 bytes)
+     *
+     * Total = 65 bytes.
+     */
+    if (
+      publicBytes.length !==
+        65 ||
+      publicBytes[0] !==
+        0x04
+    ) {
+      return {
+        valid: null,
+        signatureBytes:
+          null,
+      };
+    }
+
+    const x =
+      publicBytes
+        .subarray(
+          1,
+          33
+        )
+        .toString(
+          'base64url'
+        );
+
+    const y =
+      publicBytes
+        .subarray(
+          33,
+          65
+        )
+        .toString(
+          'base64url'
+        );
+
+    const key =
+      createPublicKey({
+        key: {
+          kty: 'EC',
+          crv: 'P-256',
+          x,
+          y,
+        } as any,
+
+        format: 'jwk',
+      });
+
+    const signature =
+      Buffer.from(
+        signatureSegment,
+        'base64url'
+      );
+
+    const signingInput =
+      Buffer.from(
+        `${headerSegment}.${payloadSegment}`,
+        'utf8'
+      );
+
+    /*
+     * JWT ES256 usa assinatura JOSE:
+     * R || S = 64 bytes.
+     */
+    const valid =
+      cryptoVerify(
+        'sha256',
+        signingInput,
+        {
+          key,
+          dsaEncoding:
+            'ieee-p1363',
+        },
+        signature
+      );
+
+    return {
+      valid,
+
+      signatureBytes:
+        signature.length,
+    };
+  } catch {
+    return {
+      valid: null,
+
+      signatureBytes:
+        null,
+    };
+  }
+}
+
+function buildVapidDebug(
+  webPush:
+    ReturnType<
+      typeof getWebPush
+    >,
+
+  subscription:
+    WebPushSubscription,
+
+  payload: string
+): VapidDebug {
+  const now =
+    Math.floor(
+      Date.now() /
+      1000
+    );
+
+  const empty:
+    VapidDebug =
+    {
+      serverNow:
+        new Date()
+          .toISOString(),
+
+      endpointOrigin:
+        null,
+
+      endpointHost:
+        null,
+
+      applePushEndpoint:
+        false,
+
+      authorizationScheme:
+        null,
+
+      jwtExtracted:
+        false,
+
+      jwtSegments:
+        0,
+
+      alg:
+        null,
+
+      typ:
+        null,
+
+      aud:
+        null,
+
+      audMatchesEndpointOrigin:
+        null,
+
+      subPreview:
+        null,
+
+      subValid:
+        null,
+
+      exp:
+        null,
+
+      expIso:
+        null,
+
+      expSecondsFromNow:
+        null,
+
+      expInFuture:
+        null,
+
+      expWithin24Hours:
+        null,
+
+      authorizationPublicKeyPresent:
+        false,
+
+      authorizationPublicKeyMatchesConfigured:
+        null,
+
+      configuredPublicKeyBytes:
+        null,
+
+      configuredPrivateKeyPresent:
+        Boolean(
+          cleanEnv(
+            process.env
+              .VAPID_PRIVATE_KEY
+          )
+        ),
+
+      signaturePresent:
+        false,
+
+      signatureBytes:
+        null,
+
+      signatureValidWithConfiguredPublicKey:
+        null,
+
+      debugError:
+        null,
+    };
+
+  try {
+    const endpointUrl =
+      new URL(
+        subscription.endpoint
+      );
+
+    empty.endpointOrigin =
+      endpointUrl.origin;
+
+    empty.endpointHost =
+      endpointUrl.hostname;
+
+    empty.applePushEndpoint =
+      endpointUrl.hostname ===
+        'web.push.apple.com' ||
+      endpointUrl.hostname
+        .endsWith(
+          '.push.apple.com'
+        );
+
+    /*
+     * O web-push usa exatamente esta função
+     * internamente antes de enviar.
+     *
+     * Nenhuma requisição é feita aqui.
+     */
+    const details =
+      webPush
+        .generateRequestDetails(
+          subscription,
+          payload,
+          {
+            TTL: 300,
+          }
+        );
+
+    const authorization =
+      getHeader(
+        details.headers,
+        'authorization'
+      );
+
+    const cryptoKey =
+      getHeader(
+        details.headers,
+        'crypto-key'
+      );
+
+    if (
+      authorization
+    ) {
+      empty.authorizationScheme =
+        authorization
+          .trim()
+          .split(/\s+/)[0] ??
+        null;
+    }
+
+    const jwt =
+      extractJwt(
+        authorization
+      );
+
+    const authPublicKey =
+      extractAuthorizationPublicKey(
+        authorization,
+        cryptoKey
+      );
+
+    const configuredPublicKey =
+      cleanEnv(
+        process.env
+          .NEXT_PUBLIC_VAPID_PUBLIC_KEY
+      );
+
+    if (
+      configuredPublicKey
+    ) {
+      try {
+        empty.configuredPublicKeyBytes =
+          Buffer.from(
+            configuredPublicKey,
+            'base64url'
+          ).length;
+      } catch {
+        empty.configuredPublicKeyBytes =
+          null;
+      }
+    }
+
+    empty.authorizationPublicKeyPresent =
+      Boolean(
+        authPublicKey
+      );
+
+    if (
+      authPublicKey &&
+      configuredPublicKey
+    ) {
+      empty.authorizationPublicKeyMatchesConfigured =
+        authPublicKey ===
+        configuredPublicKey;
+    }
+
+    if (!jwt) {
+      empty.debugError =
+        'Não foi possível extrair o JWT do Authorization header.';
+
+      return empty;
+    }
+
+    empty.jwtExtracted =
+      true;
+
+    const segments =
+      jwt.split('.');
+
+    empty.jwtSegments =
+      segments.length;
+
+    if (
+      segments.length !==
+        3
+    ) {
+      empty.debugError =
+        'JWT não possui 3 segmentos.';
+
+      return empty;
+    }
+
+    const header =
+      decodeJwtJson(
+        segments[0]
+      );
+
+    const claims =
+      decodeJwtJson(
+        segments[1]
+      );
+
+    empty.signaturePresent =
+      Boolean(
+        segments[2]
+      );
+
+    if (header) {
+      empty.alg =
+        typeof header.alg ===
+          'string'
+          ? header.alg
+          : null;
+
+      empty.typ =
+        typeof header.typ ===
+          'string'
+          ? header.typ
+          : null;
+    }
+
+    if (claims) {
+      empty.aud =
+        typeof claims.aud ===
+          'string'
+          ? claims.aud
+          : null;
+
+      if (
+        empty.aud &&
+        empty.endpointOrigin
+      ) {
+        empty.audMatchesEndpointOrigin =
+          empty.aud ===
+          empty.endpointOrigin;
+      }
+
+      empty.subPreview =
+        maskSubject(
+          claims.sub
+        );
+
+      empty.subValid =
+        subjectIsValid(
+          claims.sub
+        );
+
+      const exp =
+        typeof claims.exp ===
+          'number'
+          ? claims.exp
+          : Number(
+              claims.exp
+            );
+
+      if (
+        Number.isFinite(
+          exp
+        )
+      ) {
+        empty.exp =
+          exp;
+
+        empty.expSecondsFromNow =
+          exp - now;
+
+        empty.expInFuture =
+          exp > now;
+
+        empty.expWithin24Hours =
+          exp > now &&
+          exp - now <=
+            86400;
+
+        try {
+          empty.expIso =
+            new Date(
+              exp *
+              1000
+            ).toISOString();
+        } catch {
+          empty.expIso =
+            null;
+        }
+      }
+    }
+
+    if (
+      configuredPublicKey
+    ) {
+      const verification =
+        verifyJwtSignature(
+          jwt,
+          configuredPublicKey
+        );
+
+      empty.signatureValidWithConfiguredPublicKey =
+        verification.valid;
+
+      empty.signatureBytes =
+        verification.signatureBytes;
+    }
+
+    return empty;
+  } catch (error) {
+    empty.debugError =
+      safeError(
+        error
+      );
+
+    return empty;
+  }
+}
+
+/* =========================================================
+   DEVICE
 ========================================================= */
 
 function getDevice(
-  job: ReminderJobRow
+  job:
+    ReminderJobRow
 ): PushDeviceRow | null {
   if (
     Array.isArray(
@@ -589,10 +1465,6 @@ function isInQuietHours(
     return false;
   }
 
-  /*
-   * Exemplo:
-   * 13:00 → 18:00
-   */
   if (
     startMinutes <
       endMinutes
@@ -605,10 +1477,6 @@ function isInQuietHours(
     );
   }
 
-  /*
-   * Exemplo:
-   * 23:00 → 07:00
-   */
   return (
     current >=
       startMinutes ||
@@ -691,7 +1559,7 @@ function quietEndUtc(
 }
 
 /* =========================================================
-   GET /api/cron/reminders
+   CRON
 ========================================================= */
 
 export async function GET(
@@ -703,9 +1571,10 @@ export async function GET(
     ===================================================== */
 
     const cronSecret =
-      process.env
-        .CRON_SECRET
-        ?.trim();
+      cleanEnv(
+        process.env
+          .CRON_SECRET
+      );
 
     if (!cronSecret) {
       return reply(
@@ -725,13 +1594,10 @@ export async function GET(
       );
     }
 
-    const authorization =
+    if (
       request.headers.get(
         'authorization'
-      );
-
-    if (
-      authorization !==
+      ) !==
       `Bearer ${cronSecret}`
     ) {
       return reply(
@@ -756,34 +1622,19 @@ export async function GET(
     ===================================================== */
 
     const supabaseUrl =
-      process.env
-        .SUPABASE_URL
-        ?.trim();
+      cleanEnv(
+        process.env
+          .SUPABASE_URL
+      );
 
     const supabaseSecretKey =
-      process.env
-        .SUPABASE_SECRET_KEY
-        ?.trim();
-
-    if (!supabaseUrl) {
-      return reply(
-        {
-          ok: false,
-
-          version:
-            CRON_VERSION,
-
-          stage:
-            'supabase-configuration',
-
-          error:
-            'SUPABASE_URL não configurada.',
-        },
-        503
+      cleanEnv(
+        process.env
+          .SUPABASE_SECRET_KEY
       );
-    }
 
     if (
+      !supabaseUrl ||
       !supabaseSecretKey
     ) {
       return reply(
@@ -797,7 +1648,7 @@ export async function GET(
             'supabase-configuration',
 
           error:
-            'SUPABASE_SECRET_KEY não configurada.',
+            'SUPABASE_URL ou SUPABASE_SECRET_KEY não configurada.',
         },
         503
       );
@@ -818,18 +1669,11 @@ export async function GET(
             detectSessionInUrl:
               false,
           },
-
-          global: {
-            headers: {
-              'X-Client-Info':
-                'medica-pwa-cron',
-            },
-          },
         }
       );
 
     /* =====================================================
-       3. TESTAR SUPABASE
+       3. CONTAR DEVICES
     ===================================================== */
 
     const {
@@ -837,7 +1681,7 @@ export async function GET(
         deviceCount,
 
       error:
-        connectionError,
+        deviceError,
     } =
       await supabase
         .from(
@@ -854,9 +1698,7 @@ export async function GET(
           }
         );
 
-    if (
-      connectionError
-    ) {
+    if (deviceError) {
       return reply(
         {
           ok: false,
@@ -871,23 +1713,17 @@ export async function GET(
             'Falha ao acessar push_devices.',
 
           code:
-            connectionError
-              .code,
+            deviceError.code,
 
           detail:
-            connectionError
-              .message,
-
-          hint:
-            connectionError
-              .hint,
+            deviceError.message,
         },
         500
       );
     }
 
     /* =====================================================
-       4. VAPID
+       4. WEB PUSH
     ===================================================== */
 
     let webPush:
@@ -910,7 +1746,7 @@ export async function GET(
             'vapid',
 
           error:
-            'Falha ao configurar Web Push.',
+            'Falha ao configurar VAPID.',
 
           detail:
             safeError(
@@ -922,14 +1758,12 @@ export async function GET(
     }
 
     /* =====================================================
-       5. BUSCAR JOBS VENCIDOS
+       5. JOBS VENCIDOS
     ===================================================== */
 
-    const now =
-      new Date();
-
     const nowIso =
-      now.toISOString();
+      new Date()
+        .toISOString();
 
     const {
       data:
@@ -960,6 +1794,7 @@ export async function GET(
             active,
             last_sent_at,
             locked_until,
+
             push_devices!inner (
               subscription,
               timezone,
@@ -989,13 +1824,9 @@ export async function GET(
               true,
           }
         )
-        .limit(
-          100
-        );
+        .limit(100);
 
-    if (
-      jobsError
-    ) {
+    if (jobsError) {
       return reply(
         {
           ok: false,
@@ -1010,16 +1841,10 @@ export async function GET(
             'Falha ao consultar reminder_jobs.',
 
           code:
-            jobsError
-              .code,
+            jobsError.code,
 
           detail:
-            jobsError
-              .message,
-
-          hint:
-            jobsError
-              .hint,
+            jobsError.message,
         },
         500
       );
@@ -1040,27 +1865,28 @@ export async function GET(
       jobs.length;
 
     let claimed = 0;
+    let skippedLocked = 0;
     let sent = 0;
     let failed = 0;
     let quiet = 0;
     let expired = 0;
-    let skippedLocked = 0;
-
-    /*
-     * Mantemos os erros desta execução
-     * para aparecerem diretamente no JSON.
-     */
-    const pushErrors:
-      PushErrorDiagnostic[] =
-      [];
 
     let lastPushError:
       PushErrorDiagnostic |
       null =
       null;
 
+    let lastVapidDebug:
+      VapidDebug |
+      null =
+      null;
+
+    const pushErrors:
+      PushErrorDiagnostic[] =
+      [];
+
     /* =====================================================
-       7. PROCESSAR JOBS
+       7. PROCESSAR
     ===================================================== */
 
     for (
@@ -1069,28 +1895,25 @@ export async function GET(
       const iterationNow =
         new Date();
 
-      const iterationNowIso =
-        iterationNow
-          .toISOString();
-
       /* ===================================================
-         7.1 LOCK EXISTENTE
+         LOCK
       =================================================== */
 
       if (
         job.locked_until
       ) {
-        const lockDate =
+        const lock =
           new Date(
             job.locked_until
           );
 
         if (
           Number.isFinite(
-            lockDate.getTime()
+            lock.getTime()
           ) &&
-          lockDate.getTime() >
-            iterationNow.getTime()
+          lock.getTime() >
+            iterationNow
+              .getTime()
         ) {
           skippedLocked++;
 
@@ -1098,14 +1921,11 @@ export async function GET(
         }
       }
 
-      /* ===================================================
-         7.2 CLAIM
-      =================================================== */
-
       const lockUntil =
         new Date(
-          iterationNow.getTime() +
-            2 * 60_000
+          iterationNow
+            .getTime() +
+          2 * 60_000
         ).toISOString();
 
       let claimQuery =
@@ -1118,7 +1938,8 @@ export async function GET(
               lockUntil,
 
             updated_at:
-              iterationNowIso,
+              iterationNow
+                .toISOString(),
           })
           .eq(
             'device_id',
@@ -1161,15 +1982,8 @@ export async function GET(
             'occurrence_id'
           );
 
-      if (
-        claimError
-      ) {
+      if (claimError) {
         failed++;
-
-        console.error(
-          '[CRON] Falha ao criar lock:',
-          claimError
-        );
 
         continue;
       }
@@ -1187,13 +2001,11 @@ export async function GET(
       claimed++;
 
       /* ===================================================
-         7.3 DEVICE
+         DEVICE
       =================================================== */
 
       const device =
-        getDevice(
-          job
-        );
+        getDevice(job);
 
       if (
         !device ||
@@ -1205,12 +2017,9 @@ export async function GET(
             'reminder_jobs'
           )
           .update({
-            active:
-              false,
-
+            active: false,
             locked_until:
               null,
-
             updated_at:
               new Date()
                 .toISOString(),
@@ -1235,7 +2044,7 @@ export async function GET(
           : 'UTC';
 
       /* ===================================================
-         7.4 QUIET HOURS
+         QUIET HOURS
       =================================================== */
 
       if (
@@ -1262,7 +2071,7 @@ export async function GET(
               device.quiet_end
             )
           ) {
-            const resumeAt =
+            const next =
               quietEndUtc(
                 iterationNow,
                 timezone,
@@ -1270,62 +2079,43 @@ export async function GET(
                 device.quiet_end
               );
 
-            const {
-              error:
-                quietError,
-            } =
-              await supabase
-                .from(
-                  'reminder_jobs'
-                )
-                .update({
-                  next_notify_at:
-                    resumeAt
-                      .toISOString(),
+            await supabase
+              .from(
+                'reminder_jobs'
+              )
+              .update({
+                next_notify_at:
+                  next
+                    .toISOString(),
 
-                  locked_until:
-                    null,
+                locked_until:
+                  null,
 
-                  updated_at:
-                    new Date()
-                      .toISOString(),
-                })
-                .eq(
-                  'device_id',
-                  job.device_id
-                )
-                .eq(
-                  'occurrence_id',
-                  job.occurrence_id
-                );
-
-            if (
-              quietError
-            ) {
-              failed++;
-
-              console.error(
-                '[CRON] Quiet hours update:',
-                quietError
+                updated_at:
+                  new Date()
+                    .toISOString(),
+              })
+              .eq(
+                'device_id',
+                job.device_id
+              )
+              .eq(
+                'occurrence_id',
+                job.occurrence_id
               );
-            } else {
-              quiet++;
-            }
+
+            quiet++;
 
             continue;
           }
-        } catch (error) {
-          console.error(
-            '[CRON] Quiet hours inválido:',
-            safeError(
-              error
-            )
-          );
+        } catch {
+          // Se timezone estiver inválido,
+          // continua o envio normalmente.
         }
       }
 
       /* ===================================================
-         7.5 DEADLINE
+         PAYLOAD
       =================================================== */
 
       const deadline =
@@ -1342,8 +2132,7 @@ export async function GET(
             deadline.getTime()
           ) &&
           deadline.getTime() <=
-            iterationNow
-              .getTime()
+            Date.now()
         );
 
       const overdue =
@@ -1352,10 +2141,6 @@ export async function GET(
           'deadline' ||
         job.phase ===
           'repeat';
-
-      /* ===================================================
-         7.6 PAYLOAD
-      =================================================== */
 
       const payload =
         JSON.stringify({
@@ -1397,13 +2182,25 @@ export async function GET(
         });
 
       /* ===================================================
-         7.7 ENVIAR PUSH
+         PUSH
       =================================================== */
 
       try {
         const subscription =
           parseSubscription(
             device.subscription
+          );
+
+        /*
+         * GERAR DIAGNÓSTICO ANTES DO ENVIO.
+         *
+         * Isso NÃO envia nenhuma notificação.
+         */
+        lastVapidDebug =
+          buildVapidDebug(
+            webPush,
+            subscription,
+            payload
           );
 
         await webPush
@@ -1418,8 +2215,7 @@ export async function GET(
         sent++;
 
         /* =================================================
-           NÃO OBRIGATÓRIO:
-           ENVIA UMA VEZ
+           REMÉDIO NÃO OBRIGATÓRIO
         ================================================= */
 
         if (
@@ -1428,55 +2224,41 @@ export async function GET(
           job.required ===
             false
         ) {
-          const {
-            error:
-              doneError,
-          } =
-            await supabase
-              .from(
-                'reminder_jobs'
-              )
-              .update({
-                active:
-                  false,
+          await supabase
+            .from(
+              'reminder_jobs'
+            )
+            .update({
+              active: false,
 
-                phase:
-                  'done',
+              phase:
+                'done',
 
-                last_sent_at:
-                  new Date()
-                    .toISOString(),
+              last_sent_at:
+                new Date()
+                  .toISOString(),
 
-                locked_until:
-                  null,
+              locked_until:
+                null,
 
-                updated_at:
-                  new Date()
-                    .toISOString(),
-              })
-              .eq(
-                'device_id',
-                job.device_id
-              )
-              .eq(
-                'occurrence_id',
-                job.occurrence_id
-              );
-
-          if (
-            doneError
-          ) {
-            console.error(
-              '[CRON] Falha ao finalizar job:',
-              doneError
+              updated_at:
+                new Date()
+                  .toISOString(),
+            })
+            .eq(
+              'device_id',
+              job.device_id
+            )
+            .eq(
+              'occurrence_id',
+              job.occurrence_id
             );
-          }
 
           continue;
         }
 
         /* =================================================
-           MAIN → DEADLINE
+           IR PARA DEADLINE
         ================================================= */
 
         if (
@@ -1489,50 +2271,37 @@ export async function GET(
           deadline.getTime() >
             Date.now()
         ) {
-          const {
-            error:
-              deadlineError,
-          } =
-            await supabase
-              .from(
-                'reminder_jobs'
-              )
-              .update({
-                next_notify_at:
-                  deadline
-                    .toISOString(),
+          await supabase
+            .from(
+              'reminder_jobs'
+            )
+            .update({
+              next_notify_at:
+                deadline
+                  .toISOString(),
 
-                phase:
-                  'deadline',
+              phase:
+                'deadline',
 
-                last_sent_at:
-                  new Date()
-                    .toISOString(),
+              last_sent_at:
+                new Date()
+                  .toISOString(),
 
-                locked_until:
-                  null,
+              locked_until:
+                null,
 
-                updated_at:
-                  new Date()
-                    .toISOString(),
-              })
-              .eq(
-                'device_id',
-                job.device_id
-              )
-              .eq(
-                'occurrence_id',
-                job.occurrence_id
-              );
-
-          if (
-            deadlineError
-          ) {
-            console.error(
-              '[CRON] Falha ao definir deadline:',
-              deadlineError
+              updated_at:
+                new Date()
+                  .toISOString(),
+            })
+            .eq(
+              'device_id',
+              job.device_id
+            )
+            .eq(
+              'occurrence_id',
+              job.occurrence_id
             );
-          }
 
           continue;
         }
@@ -1559,77 +2328,60 @@ export async function GET(
             ? configured
             : 30;
 
-        const nextNotifyAt =
+        const next =
           new Date(
             Date.now() +
-              repeatMinutes *
-                60_000
+            repeatMinutes *
+              60_000
           );
 
-        const {
-          error:
-            repeatError,
-        } =
-          await supabase
-            .from(
-              'reminder_jobs'
-            )
-            .update({
-              next_notify_at:
-                nextNotifyAt
-                  .toISOString(),
+        await supabase
+          .from(
+            'reminder_jobs'
+          )
+          .update({
+            next_notify_at:
+              next
+                .toISOString(),
 
-              phase:
-                'repeat',
+            phase:
+              'repeat',
 
-              last_sent_at:
-                new Date()
-                  .toISOString(),
+            last_sent_at:
+              new Date()
+                .toISOString(),
 
-              locked_until:
-                null,
+            locked_until:
+              null,
 
-              updated_at:
-                new Date()
-                  .toISOString(),
-            })
-            .eq(
-              'device_id',
-              job.device_id
-            )
-            .eq(
-              'occurrence_id',
-              job.occurrence_id
-            );
-
-        if (
-          repeatError
-        ) {
-          console.error(
-            '[CRON] Falha ao reagendar:',
-            repeatError
+            updated_at:
+              new Date()
+                .toISOString(),
+          })
+          .eq(
+            'device_id',
+            job.device_id
+          )
+          .eq(
+            'occurrence_id',
+            job.occurrence_id
           );
-        }
       } catch (error) {
         failed++;
-
-        /* ===============================================
-           DIAGNÓSTICO COMPLETO DO PUSH
-        =============================================== */
 
         const statusCode =
           getPushStatusCode(
             error
           );
 
-        const pushErrorBody =
+        const body =
           getPushErrorBody(
             error
           );
 
-        const pushReason =
+        const reason =
           getPushErrorReason(
-            pushErrorBody
+            body
           );
 
         const diagnostic:
@@ -1648,20 +2400,17 @@ export async function GET(
                 error
               ),
 
-            reason:
-              pushReason,
+            reason,
 
-            body:
-              pushErrorBody,
+            body,
+
+            vapidDebug:
+              lastVapidDebug,
           };
 
         lastPushError =
           diagnostic;
 
-        /*
-         * Máximo 10 para não
-         * criar resposta gigantesca.
-         */
         if (
           pushErrors.length <
             10
@@ -1681,10 +2430,8 @@ export async function GET(
         ================================================= */
 
         if (
-          statusCode ===
-            404 ||
-          statusCode ===
-            410
+          statusCode === 404 ||
+          statusCode === 410
         ) {
           expired++;
 
@@ -1693,8 +2440,7 @@ export async function GET(
               'push_devices'
             )
             .update({
-              active:
-                false,
+              active: false,
 
               updated_at:
                 new Date()
@@ -1710,8 +2456,7 @@ export async function GET(
               'reminder_jobs'
             )
             .update({
-              active:
-                false,
+              active: false,
 
               locked_until:
                 null,
@@ -1729,58 +2474,44 @@ export async function GET(
         }
 
         /* =================================================
-           ERRO TEMPORÁRIO:
-           TENTAR NOVAMENTE EM 5 MINUTOS
+           RETRY EM 5 MINUTOS
         ================================================= */
 
-        const retryAt =
+        const retry =
           new Date(
             Date.now() +
-              5 * 60_000
+            5 * 60_000
           );
 
-        const {
-          error:
-            retryError,
-        } =
-          await supabase
-            .from(
-              'reminder_jobs'
-            )
-            .update({
-              next_notify_at:
-                retryAt
-                  .toISOString(),
+        await supabase
+          .from(
+            'reminder_jobs'
+          )
+          .update({
+            next_notify_at:
+              retry
+                .toISOString(),
 
-              locked_until:
-                null,
+            locked_until:
+              null,
 
-              updated_at:
-                new Date()
-                  .toISOString(),
-            })
-            .eq(
-              'device_id',
-              job.device_id
-            )
-            .eq(
-              'occurrence_id',
-              job.occurrence_id
-            );
-
-        if (
-          retryError
-        ) {
-          console.error(
-            '[CRON] Falha ao reagendar após erro Push:',
-            retryError
+            updated_at:
+              new Date()
+                .toISOString(),
+          })
+          .eq(
+            'device_id',
+            job.device_id
+          )
+          .eq(
+            'occurrence_id',
+            job.occurrence_id
           );
-        }
       }
     }
 
     /* =====================================================
-       8. RESULTADO
+       RESULTADO
     ===================================================== */
 
     return reply({
@@ -1813,15 +2544,16 @@ export async function GET(
       failed,
 
       /*
-       * ESTE É O CAMPO PRINCIPAL
-       * QUE QUEREMOS VER.
+       * NOVO:
+       *
+       * Mostra os claims e validações
+       * do último JWT VAPID gerado.
        */
+      vapidDebug:
+        lastVapidDebug,
+
       lastPushError,
 
-      /*
-       * Caso mais de um lembrete
-       * falhe na mesma execução.
-       */
       pushErrors,
 
       quiet,
@@ -1834,11 +2566,6 @@ export async function GET(
           .toISOString(),
     });
   } catch (error) {
-    console.error(
-      '[CRON][UNHANDLED]',
-      error
-    );
-
     return reply(
       {
         ok: false,
